@@ -9,11 +9,14 @@ function socketUrl() {
   return SOCKET_URL || window.location.origin;
 }
 
+const PALAVRAS_POR_JOGADOR = 3;
+
 export default function App() {
   const [nome, setNome] = useState(() => localStorage.getItem("impostor-nome") || "");
   const [codigoEntrada, setCodigoEntrada] = useState("");
   const [erro, setErro] = useState("");
   const [socket, setSocket] = useState(null);
+  const [meuId, setMeuId] = useState(null);
   const [conectado, setConectado] = useState(false);
   const [sala, setSala] = useState(null);
   const [voceEhDono, setVoceEhDono] = useState(false);
@@ -21,7 +24,13 @@ export default function App() {
   const [podeVerPalavra, setPodeVerPalavra] = useState(false);
   const [revelacao, setRevelacao] = useState(null);
   const [clicouVerPalavra, setClicouVerPalavra] = useState(false);
+  const [lobbyInput, setLobbyInput] = useState("");
+  const [pistaInput, setPistaInput] = useState("");
+  const [jaVotei, setJaVotei] = useState(false);
+  const chatRef = useRef(null);
   const donoRef = useRef(false);
+  const faseAnteriorRef = useRef(null);
+
   useEffect(() => {
     donoRef.current = voceEhDono;
   }, [voceEhDono]);
@@ -35,20 +44,41 @@ export default function App() {
     setPodeVerPalavra(false);
     setRevelacao(null);
     setClicouVerPalavra(false);
+    setPistaInput("");
+    setJaVotei(false);
   }, []);
 
   useEffect(() => {
     const s = io(socketUrl(), { transports: ["websocket", "polling"] });
     setSocket(s);
-    s.on("connect", () => setConectado(true));
-    s.on("disconnect", () => setConectado(false));
-    s.on("estadoSala", (estado) => {
+
+    const applyEstado = (estado) => {
+      if (!estado) return;
+      const faseNova = estado.rodadaAtiva ? estado.faseRodada : null;
+      const fasePrev = faseAnteriorRef.current;
+      if (faseNova === "votacao" && fasePrev === "pistas") setJaVotei(false);
+      if (!estado.rodadaAtiva) {
+        limparRodadaUi();
+        faseAnteriorRef.current = null;
+      } else {
+        faseAnteriorRef.current = faseNova ?? null;
+      }
       setSala(estado);
-      if (!estado.rodadaAtiva) limparRodadaUi();
+    };
+
+    s.on("connect", () => {
+      setConectado(true);
+      setMeuId(s.id);
     });
+    s.on("disconnect", () => {
+      setConectado(false);
+      setMeuId(null);
+    });
+    s.on("estadoSala", applyEstado);
     s.on("rodadaIniciada", () => {
       setRodadaAtiva(true);
       setPodeVerPalavra(true);
+      setJaVotei(false);
       if (!donoRef.current) {
         setRevelacao(null);
         setClicouVerPalavra(false);
@@ -57,9 +87,7 @@ export default function App() {
     s.on("rodadaEncerrada", () => {
       limparRodadaUi();
     });
-    s.on("revelacao", (rev) => {
-      setRevelacao(rev);
-    });
+    s.on("revelacao", (rev) => setRevelacao(rev));
     s.on("saiuDaSala", () => {
       setSala(null);
       setVoceEhDono(false);
@@ -70,6 +98,15 @@ export default function App() {
       s.close();
     };
   }, [limparRodadaUi]);
+
+  useEffect(() => {
+    chatRef.current?.scrollTo({ top: chatRef.current.scrollHeight, behavior: "smooth" });
+  }, [
+    sala?.lobbyMsgs,
+    sala?.mensagensRodada,
+    sala?.faseRodada,
+    rodadaAtiva,
+  ]);
 
   const entrarLobby = useMemo(() => !sala, [sala]);
 
@@ -160,6 +197,55 @@ export default function App() {
     limparRodadaUi();
   };
 
+  const enviarLobby = (e) => {
+    e.preventDefault();
+    setErro("");
+    const t = lobbyInput.trim();
+    if (!t) return;
+    socket.emit("chatLobby", { texto: t }, (res) => {
+      if (!res?.ok) {
+        setErro(res?.erro || "Não enviado.");
+        return;
+      }
+      setLobbyInput("");
+    });
+  };
+
+  const enviarPista = (e) => {
+    e.preventDefault();
+    setErro("");
+    const t = pistaInput.trim();
+    if (!t) return;
+    socket.emit("enviarPista", { texto: t }, (res) => {
+      if (!res?.ok) {
+        setErro(res?.erro || "Não enviado.");
+        return;
+      }
+      setPistaInput("");
+    });
+  };
+
+  const votarEm = (alvoId) => {
+    setErro("");
+    socket.emit("votar", { alvoId }, (res) => {
+      if (!res?.ok) {
+        setErro(res?.erro || "Voto inválido.");
+        return;
+      }
+      setJaVotei(true);
+    });
+  };
+
+  const fase = sala?.faseRodada ?? null;
+  const minhaVezPista = Boolean(
+    rodadaAtiva && fase === "pistas" && sala?.jogadorDaVezId && meuId === sala.jogadorDaVezId,
+  );
+  const resultado = sala?.resultado ?? null;
+  const nomeJogador = (id) =>
+    sala?.jogadores?.find((j) => j.id === id)?.nome ?? "?";
+
+  const votacaoInfo = sala?.votacao ?? null;
+
   return (
     <div className="app">
       <header className="header">
@@ -168,7 +254,7 @@ export default function App() {
         {!conectado && <span className="badge warn">Conectando…</span>}
       </header>
 
-      <main className="main">
+      <main className="main wide">
         {entrarLobby ? (
           <section className="card">
             <label className="label" htmlFor="nome">
@@ -225,7 +311,9 @@ export default function App() {
             </div>
 
             <p className="hint">
-              Mínimo de 3 jogadores para gerar palavra. Máximo 10 na sala.
+              Mínimo de 3 jogadores para gerar palavra. Máximo 10 na sala. Após liberar a
+              palavra, cada um diz {PALAVRAS_POR_JOGADOR} pistas ({PALAVRAS_POR_JOGADOR}{" "}
+              palavras), um de cada vez, em ordem sorteada.
             </p>
 
             <div className="lista-jogadores">
@@ -235,10 +323,105 @@ export default function App() {
                   <li key={j.id}>
                     {j.nome}
                     {j.dono ? <span className="pill">Dono</span> : null}
+                    {fase === "pistas" && rodadaAtiva && (
+                      <span className="pill faint">
+                        {sala?.contagemPalavras?.[j.id] ?? 0}/{PALAVRAS_POR_JOGADOR} pistas
+                      </span>
+                    )}
                   </li>
                 ))}
               </ul>
             </div>
+
+            <div className="chat">
+              <p className="label">Chat da sala</p>
+              <div className="chat-log" ref={chatRef}>
+                {!rodadaAtiva &&
+                  (sala?.lobbyMsgs ?? []).map((m) => (
+                    <div key={`${m.ts}-${m.autorId}`} className="msg lobby">
+                      <span className="msg-autor">{m.autorNome}:</span> {m.texto}
+                    </div>
+                  ))}
+                {rodadaAtiva &&
+                  (sala?.mensagensRodada ?? []).map((m, i) => (
+                    <div
+                      key={`${m.ts}-${i}`}
+                      className={`msg ${m.tipo === "sistema" ? "sistema" : "pista"}`}
+                    >
+                      {m.tipo === "sistema" ? (
+                        m.texto
+                      ) : (
+                        <>
+                          <span className="msg-autor">{m.autorNome}:</span>{" "}
+                          <strong>{m.texto}</strong>
+                        </>
+                      )}
+                    </div>
+                  ))}
+              </div>
+              {!rodadaAtiva && (
+                <form className="chat-form" onSubmit={enviarLobby}>
+                  <input
+                    className="input"
+                    placeholder="Digite algo para a sala..."
+                    value={lobbyInput}
+                    onChange={(e) => setLobbyInput(e.target.value)}
+                    maxLength={120}
+                  />
+                  <button type="submit" className="btn primary">
+                    Enviar
+                  </button>
+                </form>
+              )}
+              {rodadaAtiva && fase === "pistas" && (
+                <>
+                  <p className="hint chat-hint">
+                    {minhaVezPista
+                      ? "Sua vez — uma palavra e Enter."
+                      : `Aguardando: ${nomeJogador(sala?.jogadorDaVezId)}`}
+                  </p>
+                  <form className="chat-form" onSubmit={enviarPista}>
+                    <input
+                      className="input"
+                      placeholder={minhaVezPista ? "Sua pista..." : "Não é a sua vez"}
+                      value={pistaInput}
+                      onChange={(e) => setPistaInput(e.target.value)}
+                      disabled={!minhaVezPista}
+                      maxLength={80}
+                    />
+                    <button type="submit" className="btn primary" disabled={!minhaVezPista}>
+                      Enviar
+                    </button>
+                  </form>
+                </>
+              )}
+            </div>
+
+            {fase === "votacao" && rodadaAtiva && (
+              <div className="votacao">
+                <p className="label">Quem é o impostor?</p>
+                {votacaoInfo ? (
+                  <p className="hint">
+                    Votos: {votacaoInfo.recebidos}/{votacaoInfo.total}
+                    {jaVotei ? " — você já votou." : ""}
+                  </p>
+                ) : null}
+                <ul className="voto-lista">
+                  {sala?.jogadores?.map((j) => (
+                    <li key={j.id}>
+                      <button
+                        type="button"
+                        className="btn secondary block voto-btn"
+                        onClick={() => votarEm(j.id)}
+                        disabled={jaVotei}
+                      >
+                        {j.nome}
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
 
             <div className="acoes">
               {voceEhDono ? (
@@ -284,12 +467,43 @@ export default function App() {
               {revelacao?.tipo === "impostor" && (
                 <p className="destaque impostor">Você é o impostor.</p>
               )}
-              {voceEhDono && rodadaAtiva && !revelacao && (
+              {voceEhDono && rodadaAtiva && !revelacao && fase !== "resultado" && (
                 <p className="hint center">Gerando…</p>
               )}
             </div>
 
             {erro && <p className="erro">{erro}</p>}
+
+            {fase === "resultado" && resultado && rodadaAtiva && (
+              <div className="overlay" role="dialog" aria-modal="true">
+                <div className="overlay-card">
+                  <h2 className="overlay-titulo">Resultado</h2>
+                  <p className="overlay-texto destaque">
+                    {resultado.impostorPerdeu
+                      ? "O impostor perdeu (recebeu a maioria dos votos)."
+                      : "O impostor ganhou (não recebeu a maioria dos votos)."}
+                  </p>
+                  <p className="overlay-texto">
+                    O impostor era: <strong>{nomeJogador(resultado.impostorId)}</strong>
+                  </p>
+                  <p className="overlay-texto">
+                    A palavra era: <strong>{resultado.palavra}</strong>
+                  </p>
+                  <p className="label">Votos por jogador</p>
+                  <ul className="voto-resumo">
+                    {sala?.jogadores?.map((j) => (
+                      <li key={j.id}>
+                        {j.nome}: {resultado.votosPorJogador?.[j.id] ?? 0}
+                      </li>
+                    ))}
+                  </ul>
+                  <p className="hint center">
+                    O dono da sala pode clicar em &quot;Finalizar partida&quot; para voltar ao
+                    lobby (nova palavra depois).
+                  </p>
+                </div>
+              </div>
+            )}
           </section>
         )}
       </main>
@@ -337,6 +551,9 @@ export default function App() {
         .main {
           width: 100%;
           max-width: 420px;
+        }
+        .main.wide {
+          max-width: 520px;
         }
         .card {
           background: var(--card);
@@ -453,6 +670,7 @@ export default function App() {
           display: flex;
           align-items: center;
           gap: 0.5rem;
+          flex-wrap: wrap;
         }
         .pill {
           font-size: 0.7rem;
@@ -461,6 +679,96 @@ export default function App() {
           color: #0f766e;
           padding: 0.15rem 0.45rem;
           border-radius: 999px;
+        }
+        .pill.faint {
+          background: #f5f5f4;
+          color: var(--muted);
+        }
+        .chat {
+          margin-top: 1rem;
+          border: 1px solid var(--border);
+          border-radius: 10px;
+          padding: 0.75rem;
+          background: #fafaf9;
+        }
+        .chat-log {
+          max-height: 220px;
+          overflow-y: auto;
+          font-size: 0.9rem;
+          margin-bottom: 0.65rem;
+        }
+        .msg {
+          padding: 0.35rem 0;
+          border-bottom: 1px solid var(--border);
+        }
+        .msg:last-child {
+          border-bottom: none;
+        }
+        .msg.sistema {
+          color: var(--muted);
+          font-style: italic;
+          font-size: 0.85rem;
+        }
+        .msg-autor {
+          font-weight: 600;
+          color: #44403c;
+        }
+        .chat-form {
+          display: flex;
+          gap: 0.5rem;
+          align-items: stretch;
+        }
+        .chat-hint {
+          margin-bottom: 0.5rem;
+        }
+        .votacao {
+          margin-top: 1rem;
+          padding-top: 0.75rem;
+          border-top: 1px solid var(--border);
+        }
+        .voto-lista {
+          list-style: none;
+          padding: 0;
+          margin: 0.35rem 0 0;
+        }
+        .voto-lista li {
+          margin-bottom: 0.4rem;
+        }
+        .voto-btn {
+          text-align: left;
+        }
+        .overlay {
+          position: fixed;
+          inset: 0;
+          background: rgba(28, 25, 23, 0.45);
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          z-index: 50;
+          padding: 1rem;
+        }
+        .overlay-card {
+          background: var(--card);
+          border-radius: var(--radius);
+          padding: 1.5rem;
+          max-width: 380px;
+          width: 100%;
+          border: 1px solid var(--border);
+          box-shadow: var(--shadow);
+        }
+        .overlay-titulo {
+          margin: 0 0 0.75rem;
+          font-size: 1.25rem;
+          text-align: center;
+        }
+        .overlay-texto {
+          margin: 0.5rem 0;
+          font-size: 0.95rem;
+        }
+        .voto-resumo {
+          margin: 0.25rem 0 0;
+          padding-left: 1.1rem;
+          font-size: 0.9rem;
         }
         .acoes {
           margin-top: 1.25rem;
