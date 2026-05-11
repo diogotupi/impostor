@@ -18,6 +18,7 @@ const TEXTO_CHAT_MAX = 80;
 const GRACE_MS = Number(process.env.SALA_GRACE_MS) || 8 * 60 * 1000;
 
 const app = express();
+app.set("trust proxy", 1);
 app.use(cors({ origin: true, credentials: true }));
 
 /**
@@ -65,6 +66,44 @@ function normalizarSessionId(s) {
   const t = String(s ?? "").trim();
   if (t.length < 8 || t.length > 120) return null;
   return t;
+}
+
+/** Chave estável por rede (IP do cliente) para lembrar nome no browser. */
+function getClienteChave(socket) {
+  const hdr = socket.handshake.headers["x-forwarded-for"];
+  const first =
+    typeof hdr === "string"
+      ? hdr
+          .split(",")[0]
+          ?.trim()
+          ?.replace(/^::ffff:/i, "") ?? ""
+      : "";
+  if (first) return first.slice(0, 128);
+  const addr = socket.handshake.address || socket.conn?.remoteAddress || "unknown";
+  return String(addr).replace(/^::ffff:/i, "").slice(0, 128);
+}
+
+function normalizarNomeComparacao(nome) {
+  return String(nome ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+/** @returns {{ ok: true, nome: string } | { ok: false, erro: string }} */
+function validarNomeEntrada(raw) {
+  const nome = String(raw ?? "").trim().slice(0, 24);
+  if (!nome) return { ok: false, erro: "Digite seu nome." };
+  return { ok: true, nome };
+}
+
+/** @param {SalaState} sala */
+function nomeJaUsadoPorOutro(sala, nomeNorm, excetoSessionId) {
+  for (const [sid, p] of sala.players) {
+    if (sid === excetoSessionId) continue;
+    if (normalizarNomeComparacao(p.name) === nomeNorm) return true;
+  }
+  return false;
 }
 
 function embaralhar(array) {
@@ -352,6 +391,8 @@ io.on("connection", (socket) => {
   /** @type {string | null} */
   let salaAtual = null;
 
+  socket.emit("clienteChave", { chave: getClienteChave(socket) });
+
   function sairDaSalaExplicito() {
     const meta = socket.data.impostor;
     if (!meta) return;
@@ -402,10 +443,19 @@ io.on("connection", (socket) => {
       cb?.({ ok: false, erro: "Sala não encontrada." });
       return;
     }
-    const nome = (name || "Jogador").trim().slice(0, 24) || "Jogador";
+    const v = validarNomeEntrada(name);
+    if (!v.ok) {
+      cb?.(v);
+      return;
+    }
+    const nomeNorm = normalizarNomeComparacao(v.nome);
 
     if (sala.players.has(sid)) {
-      sala.players.get(sid).name = nome;
+      if (nomeJaUsadoPorOutro(sala, nomeNorm, sid)) {
+        cb?.({ ok: false, erro: "Já existe outro jogador com esse nome na sala." });
+        return;
+      }
+      sala.players.get(sid).name = v.nome;
       anexarSocketASessao(socket, sala, c, sid);
       salaAtual = c;
       garantirTurnoComSocket(sala);
@@ -425,7 +475,12 @@ io.on("connection", (socket) => {
       return;
     }
 
-    sala.players.set(sid, { name: nome });
+    if (nomeJaUsadoPorOutro(sala, nomeNorm, sid)) {
+      cb?.({ ok: false, erro: "Já existe um jogador com esse nome na sala." });
+      return;
+    }
+
+    sala.players.set(sid, { name: v.nome });
     anexarSocketASessao(socket, sala, c, sid);
     salaAtual = c;
     broadcastEstado(c);
@@ -451,7 +506,12 @@ io.on("connection", (socket) => {
       return;
     }
     const codigo = codigoSala();
-    const name = (nome || "Jogador").trim().slice(0, 24) || "Jogador";
+    const v = validarNomeEntrada(nome);
+    if (!v.ok) {
+      cb?.(v);
+      return;
+    }
+    const name = v.nome;
     salas.set(codigo, {
       hostSessionId: sid,
       players: new Map([[sid, { name }]]),

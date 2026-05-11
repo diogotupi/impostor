@@ -12,6 +12,15 @@ function socketUrl() {
 const ROOM_STORAGE_KEY = "impostor-sala-atual";
 const SESSION_STORAGE_KEY = "impostor-session-id";
 
+function nomePorClienteStorageKey(chave) {
+  if (!chave) return "";
+  try {
+    return `impostor-nome-ip-${btoa(encodeURIComponent(chave)).replace(/=/g, "")}`;
+  } catch {
+    return "";
+  }
+}
+
 function ensureSessionId() {
   try {
     let id = localStorage.getItem(SESSION_STORAGE_KEY);
@@ -31,7 +40,8 @@ function ensureSessionId() {
 const PALAVRAS_POR_JOGADOR = 3;
 
 export default function App() {
-  const [nome, setNome] = useState(() => localStorage.getItem("impostor-nome") || "");
+  const [fluxoLobby, setFluxoLobby] = useState(() => "escolha");
+  const [nome, setNome] = useState("");
   const [codigoEntrada, setCodigoEntrada] = useState("");
   const [erro, setErro] = useState("");
   const [socket, setSocket] = useState(null);
@@ -50,14 +60,11 @@ export default function App() {
   const chatRef = useRef(null);
   const donoRef = useRef(false);
   const faseAnteriorRef = useRef(null);
+  const clienteChaveRef = useRef("");
 
   useEffect(() => {
     donoRef.current = voceEhDono;
   }, [voceEhDono]);
-
-  useEffect(() => {
-    localStorage.setItem("impostor-nome", nome);
-  }, [nome]);
 
   const limparRodadaUi = useCallback(() => {
     setRodadaAtiva(false);
@@ -79,6 +86,35 @@ export default function App() {
     });
     setSocket(s);
 
+    const tryRetomarSala = () => {
+      if (!s.connected) return;
+      if (!clienteChaveRef.current) return;
+      const raw = localStorage.getItem(ROOM_STORAGE_KEY);
+      const codigo = String(raw ?? "")
+        .trim()
+        .toUpperCase()
+        .replace(/[^A-Z0-9]/g, "");
+      if (codigo.length !== 6) return;
+      const nomeKey = nomePorClienteStorageKey(clienteChaveRef.current);
+      const nomeRetomada = nomeKey ? localStorage.getItem(nomeKey) || "" : "";
+      if (!nomeRetomada.trim()) {
+        localStorage.removeItem(ROOM_STORAGE_KEY);
+        return;
+      }
+      const sessionId = ensureSessionId();
+      s.emit(
+        "entrarSala",
+        { codigo, nome: nomeRetomada.trim(), sessionId },
+        (res) => {
+          if (!res?.ok) {
+            localStorage.removeItem(ROOM_STORAGE_KEY);
+            return;
+          }
+          applyEstado(res.estado);
+        },
+      );
+    };
+
     const applyEstado = (estado) => {
       if (!estado) return;
       const faseNova = estado.rodadaAtiva ? estado.faseRodada : null;
@@ -97,31 +133,13 @@ export default function App() {
       setSala(estado);
     };
 
-    const retomarSalaSeHouver = () => {
-      const raw = localStorage.getItem(ROOM_STORAGE_KEY);
-      const codigo = String(raw ?? "")
-        .trim()
-        .toUpperCase()
-        .replace(/[^A-Z0-9]/g, "");
-      if (codigo.length !== 6) return;
-      const sessionId = ensureSessionId();
-      const nomeRetomada = localStorage.getItem("impostor-nome") || "";
-      s.emit(
-        "entrarSala",
-        { codigo, nome: nomeRetomada, sessionId },
-        (res) => {
-          if (!res?.ok) {
-            localStorage.removeItem(ROOM_STORAGE_KEY);
-            return;
-          }
-          applyEstado(res.estado);
-        },
-      );
-    };
-
+    s.on("clienteChave", ({ chave }) => {
+      clienteChaveRef.current = String(chave || "");
+      tryRetomarSala();
+    });
     s.on("connect", () => {
       setConectado(true);
-      retomarSalaSeHouver();
+      tryRetomarSala();
     });
     s.on("disconnect", () => {
       setConectado(false);
@@ -130,6 +148,8 @@ export default function App() {
       localStorage.removeItem(ROOM_STORAGE_KEY);
       setSala(null);
       setVoceEhDono(false);
+      setFluxoLobby("escolha");
+      setNome("");
       limparRodadaUi();
       setErro("Esta sessão foi aberta em outro dispositivo ou aba.");
     });
@@ -152,6 +172,8 @@ export default function App() {
       localStorage.removeItem(ROOM_STORAGE_KEY);
       setSala(null);
       setVoceEhDono(false);
+      setFluxoLobby("escolha");
+      setNome("");
       limparRodadaUi();
     });
 
@@ -182,18 +204,49 @@ export default function App() {
 
   const entrarLobby = useMemo(() => !sala, [sala]);
 
+  const fase = sala?.faseRodada ?? null;
+  const meuSessionId = ensureSessionId();
+  const minhaVezPista = Boolean(
+    rodadaAtiva &&
+      fase === "pistas" &&
+      sala?.jogadorDaVezId &&
+      meuSessionId === sala.jogadorDaVezId,
+  );
+
+  const prevMinhaVezRef = useRef(false);
+  useEffect(() => {
+    if (minhaVezPista && !prevMinhaVezRef.current) {
+      try {
+        navigator.vibrate?.([80, 45, 80, 45, 120]);
+      } catch {
+        /* ignore */
+      }
+    }
+    prevMinhaVezRef.current = minhaVezPista;
+  }, [minhaVezPista]);
+
+  const salvarNomePorCliente = (nomeSalvo) => {
+    const k = nomePorClienteStorageKey(clienteChaveRef.current);
+    if (k) localStorage.setItem(k, nomeSalvo.trim());
+  };
+
   const criarSala = () => {
     setErro("");
+    if (!nome.trim()) {
+      setErro("Digite seu nome.");
+      return;
+    }
     if (!socket?.connected) {
       setErro("Aguardando conexão…");
       return;
     }
     const sessionId = ensureSessionId();
-    socket.emit("criarSala", { nome, sessionId }, (res) => {
+    socket.emit("criarSala", { nome: nome.trim(), sessionId }, (res) => {
       if (!res?.ok) {
         setErro(res?.erro || "Não foi possível criar a sala.");
         return;
       }
+      salvarNomePorCliente(nome);
       localStorage.setItem(ROOM_STORAGE_KEY, res.codigo);
       setSala(res.estado);
       setVoceEhDono(true);
@@ -203,6 +256,10 @@ export default function App() {
 
   const entrarSala = () => {
     setErro("");
+    if (!nome.trim()) {
+      setErro("Digite seu nome.");
+      return;
+    }
     if (!socket?.connected) {
       setErro("Aguardando conexão…");
       return;
@@ -213,11 +270,12 @@ export default function App() {
       return;
     }
     const sessionId = ensureSessionId();
-    socket.emit("entrarSala", { codigo: c, nome, sessionId }, (res) => {
+    socket.emit("entrarSala", { codigo: c, nome: nome.trim(), sessionId }, (res) => {
       if (!res?.ok) {
         setErro(res?.erro || "Não foi possível entrar.");
         return;
       }
+      salvarNomePorCliente(nome);
       localStorage.setItem(ROOM_STORAGE_KEY, c);
       setSala(res.estado);
       setVoceEhDono(!!res.voceEhDono);
@@ -271,6 +329,9 @@ export default function App() {
     socket.emit("sairSala");
     setSala(null);
     setVoceEhDono(false);
+    setFluxoLobby("escolha");
+    setNome("");
+    setCodigoEntrada("");
     limparRodadaUi();
   };
 
@@ -313,14 +374,6 @@ export default function App() {
     });
   };
 
-  const fase = sala?.faseRodada ?? null;
-  const meuSessionId = ensureSessionId();
-  const minhaVezPista = Boolean(
-    rodadaAtiva &&
-      fase === "pistas" &&
-      sala?.jogadorDaVezId &&
-      meuSessionId === sala.jogadorDaVezId,
-  );
   const resultado = sala?.resultado ?? null;
   const nomeJogador = (id) =>
     sala?.jogadores?.find((j) => j.id === id)?.nome ?? "?";
@@ -381,50 +434,127 @@ export default function App() {
 
       <main className="main wide">
         {entrarLobby ? (
-          <section className="card glass">
-            <label className="label" htmlFor="nome">
-              Seu nome (opcional)
-            </label>
-            <input
-              id="nome"
-              className="input"
-              value={nome}
-              onChange={(e) => setNome(e.target.value)}
-              placeholder="Ex.: Ana"
-              maxLength={24}
-            />
-
-            <div className="divider" />
-
-            <button type="button" className="btn primary block" onClick={criarSala}>
-              Gerar sala
-            </button>
-            <p className="hint">Cria um código para amigos entrarem. Você será o dono da sala.</p>
-
-            <div className="divider" />
-
-            <label className="label" htmlFor="codigo">
-              Entrar em sala
-            </label>
-            <div className="row">
+          fluxoLobby === "escolha" ? (
+            <section className="card glass menu-inicial">
+              <p className="menu-inicial-kicker">
+                <span className="slash">/</span> escolha uma opção
+              </p>
+              <button
+                type="button"
+                className="btn primary block menu-inicial-btn"
+                onClick={() => {
+                  setFluxoLobby("entrar");
+                  setNome("");
+                  setCodigoEntrada("");
+                  setErro("");
+                }}
+              >
+                Entrar numa sala
+              </button>
+              <button
+                type="button"
+                className="btn secondary block menu-inicial-btn"
+                onClick={() => {
+                  setFluxoLobby("criar");
+                  setNome("");
+                  setErro("");
+                }}
+              >
+                Criar sala
+              </button>
+              <p className="hint center menu-inicial-hint">
+                O nome é obrigatório e não pode repetir na mesma sala. Na reconexão, o seu nome é
+                lembrado automaticamente.
+              </p>
+            </section>
+          ) : fluxoLobby === "criar" ? (
+            <section className="card glass">
+              <button
+                type="button"
+                className="btn ghost block btn-voltar-lobby"
+                onClick={() => {
+                  setFluxoLobby("escolha");
+                  setErro("");
+                }}
+              >
+                ← Voltar
+              </button>
+              <h2 className="subtitulo-lobby">Criar sala</h2>
+              <p className="hint subtitulo-desc">Você será o dono e receberá o código da sala.</p>
+              <label className="label" htmlFor="nome-criar">
+                Seu nome
+              </label>
+              <input
+                id="nome-criar"
+                className="input"
+                value={nome}
+                onChange={(e) => setNome(e.target.value)}
+                placeholder="Digite seu nome"
+                maxLength={24}
+                autoComplete="off"
+              />
+              <button type="button" className="btn primary block menu-acao" onClick={criarSala}>
+                Criar sala
+              </button>
+              {erro && <p className="erro">{erro}</p>}
+            </section>
+          ) : (
+            <section className="card glass">
+              <button
+                type="button"
+                className="btn ghost block btn-voltar-lobby"
+                onClick={() => {
+                  setFluxoLobby("escolha");
+                  setErro("");
+                }}
+              >
+                ← Voltar
+              </button>
+              <h2 className="subtitulo-lobby">Entrar numa sala</h2>
+              <p className="hint subtitulo-desc">Use o código de 6 caracteres que o dono enviou.</p>
+              <label className="label" htmlFor="nome-entrar">
+                Seu nome
+              </label>
+              <input
+                id="nome-entrar"
+                className="input"
+                value={nome}
+                onChange={(e) => setNome(e.target.value)}
+                placeholder="Digite seu nome"
+                maxLength={24}
+                autoComplete="off"
+              />
+              <label className="label" htmlFor="codigo">
+                Código da sala
+              </label>
               <input
                 id="codigo"
-                className="input grow"
+                className="input"
                 value={codigoEntrada}
                 onChange={(e) => setCodigoEntrada(e.target.value.toUpperCase())}
-                placeholder="Código"
+                placeholder="XXXXXX"
                 maxLength={8}
                 autoCapitalize="characters"
               />
-              <button type="button" className="btn primary" onClick={entrarSala}>
-                Entrar
+              <button type="button" className="btn primary block menu-acao" onClick={entrarSala}>
+                Entrar na sala
               </button>
-            </div>
-
-            {erro && <p className="erro">{erro}</p>}
-          </section>
+              {erro && <p className="erro">{erro}</p>}
+            </section>
+          )
         ) : (
           <section className="card glass sala">
+            {minhaVezPista && (
+              <div className="turn-overlay" role="alert" aria-live="assertive">
+                <div className="turn-panel">
+                  <p className="turn-kicker">Rodada de pistas</p>
+                  <h2 className="turn-title">É a sua vez</h2>
+                  <p className="turn-sub">
+                    Digite <strong>uma palavra</strong> no campo abaixo e envie — todos vão ver.
+                  </p>
+                </div>
+              </div>
+            )}
             <div className="sala-top">
               <div className="sala-top-codigo">
                 <p className="label">Código da sala</p>
@@ -1195,6 +1325,110 @@ export default function App() {
         .footer-slash {
           color: var(--accent);
           opacity: 0.65;
+        }
+        .menu-inicial {
+          text-align: center;
+        }
+        .menu-inicial-kicker {
+          margin: 0 0 1.25rem;
+          font-family: var(--font-mono);
+          font-size: 0.72rem;
+          letter-spacing: 0.2em;
+          text-transform: uppercase;
+          color: var(--muted);
+        }
+        .menu-inicial-btn {
+          margin-bottom: 0.75rem;
+        }
+        .menu-inicial-hint {
+          margin-top: 1.25rem;
+          max-width: 32ch;
+          margin-left: auto;
+          margin-right: auto;
+        }
+        .btn-voltar-lobby {
+          margin-bottom: 0.75rem;
+          text-align: left;
+        }
+        .subtitulo-lobby {
+          margin: 0 0 0.35rem;
+          font-size: 1.35rem;
+          font-weight: 800;
+          text-transform: uppercase;
+          letter-spacing: 0.06em;
+        }
+        .subtitulo-desc {
+          margin: 0 0 1rem;
+        }
+        .menu-acao {
+          margin-top: 1rem;
+        }
+        .turn-overlay {
+          position: fixed;
+          left: 0;
+          right: 0;
+          bottom: 0;
+          z-index: 45;
+          padding: 0.75rem 1rem calc(0.75rem + env(safe-area-inset-bottom, 0));
+          display: flex;
+          justify-content: center;
+          pointer-events: none;
+        }
+        .turn-panel {
+          pointer-events: none;
+          max-width: 520px;
+          width: 100%;
+          padding: 1rem 1.15rem 1.1rem;
+          border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+          border: 2px solid var(--accent);
+          border-bottom: none;
+          background: linear-gradient(
+            180deg,
+            rgba(6, 6, 12, 0.97) 0%,
+            rgba(20, 8, 28, 0.95) 100%
+          );
+          box-shadow: 0 -8px 48px rgba(0, 232, 255, 0.35), 0 0 0 1px rgba(255, 45, 139, 0.35) inset,
+            0 0 80px rgba(255, 45, 139, 0.15);
+          animation: turn-pulse 1.25s ease-in-out infinite;
+        }
+        @keyframes turn-pulse {
+          0%,
+          100% {
+            box-shadow: 0 -8px 40px rgba(0, 232, 255, 0.3), 0 0 0 1px rgba(255, 45, 139, 0.3) inset;
+          }
+          50% {
+            box-shadow: 0 -12px 56px rgba(0, 232, 255, 0.55), 0 0 0 2px rgba(255, 45, 139, 0.55) inset;
+          }
+        }
+        .turn-kicker {
+          margin: 0;
+          font-family: var(--font-mono);
+          font-size: 0.68rem;
+          font-weight: 700;
+          letter-spacing: 0.35em;
+          text-transform: uppercase;
+          color: var(--magenta);
+        }
+        .turn-title {
+          margin: 0.35rem 0 0.25rem;
+          font-size: clamp(1.5rem, 5vw, 2rem);
+          font-weight: 800;
+          text-transform: uppercase;
+          letter-spacing: 0.08em;
+          line-height: 1.1;
+          background: linear-gradient(90deg, var(--accent), #fff, var(--magenta));
+          -webkit-background-clip: text;
+          background-clip: text;
+          color: transparent;
+        }
+        .turn-sub {
+          margin: 0;
+          font-size: 0.88rem;
+          color: #c8c8d8;
+          line-height: 1.45;
+        }
+        .turn-sub strong {
+          color: var(--accent);
         }
       `}</style>
     </div>
