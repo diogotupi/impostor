@@ -27,6 +27,8 @@ export default function App() {
   const [lobbyInput, setLobbyInput] = useState("");
   const [pistaInput, setPistaInput] = useState("");
   const [jaVotei, setJaVotei] = useState(false);
+  const [copiouCodigo, setCopiouCodigo] = useState(false);
+  const [resultadoOverlayFechado, setResultadoOverlayFechado] = useState(false);
   const chatRef = useRef(null);
   const donoRef = useRef(false);
   const faseAnteriorRef = useRef(null);
@@ -77,6 +79,7 @@ export default function App() {
     s.on("estadoSala", applyEstado);
     s.on("rodadaIniciada", () => {
       setRodadaAtiva(true);
+      setResultadoOverlayFechado(false);
       setPodeVerPalavra(true);
       setJaVotei(false);
       if (!donoRef.current) {
@@ -98,6 +101,10 @@ export default function App() {
       s.close();
     };
   }, [limparRodadaUi]);
+
+  useEffect(() => {
+    if (sala?.faseRodada !== "resultado") setResultadoOverlayFechado(false);
+  }, [sala?.faseRodada]);
 
   useEffect(() => {
     chatRef.current?.scrollTo({ top: chatRef.current.scrollHeight, behavior: "smooth" });
@@ -246,6 +253,37 @@ export default function App() {
 
   const votacaoInfo = sala?.votacao ?? null;
 
+  const copiarCodigo = async () => {
+    const c = sala?.codigo;
+    if (!c) return;
+    setErro("");
+    try {
+      await navigator.clipboard.writeText(c);
+    } catch {
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = c;
+        ta.style.position = "fixed";
+        ta.style.left = "-9999px";
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+      } catch {
+        setErro("Não foi possível copiar o código.");
+        return;
+      }
+    }
+    setCopiouCodigo(true);
+    window.setTimeout(() => setCopiouCodigo(false), 2000);
+  };
+
+  const mostrarOverlayResultado =
+    fase === "resultado" &&
+    resultado &&
+    rodadaAtiva &&
+    !resultadoOverlayFechado;
+
   return (
     <div className="app">
       <header className="header">
@@ -301,9 +339,19 @@ export default function App() {
         ) : (
           <section className="card sala">
             <div className="sala-top">
-              <div>
+              <div className="sala-top-codigo">
                 <p className="label">Código da sala</p>
-                <p className="codigo-grande">{sala?.codigo}</p>
+                <div className="codigo-row">
+                  <p className="codigo-grande">{sala?.codigo}</p>
+                  <button
+                    type="button"
+                    className="btn secondary btn-copiar"
+                    onClick={copiarCodigo}
+                    aria-label="Copiar código da sala"
+                  >
+                    {copiouCodigo ? "Copiado!" : "Copiar"}
+                  </button>
+                </div>
               </div>
               <button type="button" className="btn ghost" onClick={sairSala}>
                 Sair
@@ -474,10 +522,32 @@ export default function App() {
 
             {erro && <p className="erro">{erro}</p>}
 
-            {fase === "resultado" && resultado && rodadaAtiva && (
+            {fase === "resultado" && resultado && rodadaAtiva && resultadoOverlayFechado && (
+              <div className="resultado-mini">
+                <button
+                  type="button"
+                  className="btn secondary block"
+                  onClick={() => setResultadoOverlayFechado(false)}
+                >
+                  Ver resultado de novo
+                </button>
+              </div>
+            )}
+
+            {mostrarOverlayResultado && (
               <div className="overlay" role="dialog" aria-modal="true">
                 <div className="overlay-card">
-                  <h2 className="overlay-titulo">Resultado</h2>
+                  <div className="overlay-head">
+                    <h2 className="overlay-titulo">Resultado</h2>
+                    <button
+                      type="button"
+                      className="btn-overlay-fechar"
+                      onClick={() => setResultadoOverlayFechado(true)}
+                      aria-label="Fechar resultado"
+                    >
+                      ×
+                    </button>
+                  </div>
                   <p className="overlay-texto destaque">
                     {resultado.impostorPerdeu
                       ? "O impostor perdeu (recebeu a maioria dos votos)."
@@ -498,9 +568,16 @@ export default function App() {
                     ))}
                   </ul>
                   <p className="hint center">
-                    O dono da sala pode clicar em &quot;Finalizar partida&quot; para voltar ao
-                    lobby (nova palavra depois).
+                    Use &quot;Finalizar partida&quot; (dono) para voltar ao lobby e preparar nova
+                    rodada.
                   </p>
+                  <button
+                    type="button"
+                    className="btn primary block overlay-fechar-baixo"
+                    onClick={() => setResultadoOverlayFechado(true)}
+                  >
+                    Fechar
+                  </button>
                 </div>
               </div>
             )}
@@ -567,6 +644,21 @@ export default function App() {
           justify-content: space-between;
           align-items: flex-start;
           gap: 1rem;
+        }
+        .sala-top-codigo {
+          min-width: 0;
+        }
+        .codigo-row {
+          display: flex;
+          align-items: center;
+          gap: 0.6rem;
+          flex-wrap: wrap;
+        }
+        .btn-copiar {
+          flex-shrink: 0;
+          padding-left: 0.85rem;
+          padding-right: 0.85rem;
+          font-size: 0.85rem;
         }
         .codigo-grande {
           margin: 0;
@@ -756,10 +848,43 @@ export default function App() {
           border: 1px solid var(--border);
           box-shadow: var(--shadow);
         }
+        .overlay-head {
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          position: relative;
+          margin-bottom: 0.75rem;
+        }
         .overlay-titulo {
-          margin: 0 0 0.75rem;
+          margin: 0;
           font-size: 1.25rem;
           text-align: center;
+        }
+        .btn-overlay-fechar {
+          position: absolute;
+          right: 0;
+          top: 50%;
+          transform: translateY(-50%);
+          width: 2.25rem;
+          height: 2.25rem;
+          padding: 0;
+          border: none;
+          border-radius: 8px;
+          background: var(--bg);
+          color: var(--muted);
+          font-size: 1.5rem;
+          line-height: 1;
+          cursor: pointer;
+        }
+        .btn-overlay-fechar:hover {
+          background: var(--border);
+          color: var(--text);
+        }
+        .overlay-fechar-baixo {
+          margin-top: 1rem;
+        }
+        .resultado-mini {
+          margin-top: 0.75rem;
         }
         .overlay-texto {
           margin: 0.5rem 0;
