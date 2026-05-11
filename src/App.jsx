@@ -422,7 +422,7 @@ export default function App() {
         </h1>
         <p className="tagline">
           Uma palavra em comum <span className="tagline-slash">/</span>{" "}
-          <span className="tagline-accent">menos para um</span> de vocês
+          <span className="tagline-accent">Apenas um impostor</span>
         </p>
         {!conectado && (
           <span className="badge warn">
@@ -462,10 +462,6 @@ export default function App() {
               >
                 Criar sala
               </button>
-              <p className="hint center menu-inicial-hint">
-                O nome é obrigatório e não pode repetir na mesma sala. Na reconexão, o seu nome é
-                lembrado automaticamente.
-              </p>
             </section>
           ) : fluxoLobby === "criar" ? (
             <section className="card glass">
@@ -1339,12 +1335,6 @@ export default function App() {
         }
         .menu-inicial-btn {
           margin-bottom: 0.75rem;
-        }
-        .menu-inicial-hint {
-          margin-top: 1.25rem;
-          max-width: 32ch;
-          margin-left: auto;
-          margin-right: auto;
         }
         .btn-voltar-lobby {
           margin-bottom: 0.75rem;
