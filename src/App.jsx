@@ -51,12 +51,12 @@ export default function App() {
   const [rodadaAtiva, setRodadaAtiva] = useState(false);
   const [podeVerPalavra, setPodeVerPalavra] = useState(false);
   const [revelacao, setRevelacao] = useState(null);
-  const [clicouVerPalavra, setClicouVerPalavra] = useState(false);
   const [lobbyInput, setLobbyInput] = useState("");
   const [pistaInput, setPistaInput] = useState("");
   const [jaVotei, setJaVotei] = useState(false);
   const [copiouCodigo, setCopiouCodigo] = useState(false);
   const [resultadoOverlayFechado, setResultadoOverlayFechado] = useState(false);
+  const [turnoModalDisp, setTurnoModalDisp] = useState(false);
   const chatRef = useRef(null);
   const donoRef = useRef(false);
   const faseAnteriorRef = useRef(null);
@@ -70,9 +70,9 @@ export default function App() {
     setRodadaAtiva(false);
     setPodeVerPalavra(false);
     setRevelacao(null);
-    setClicouVerPalavra(false);
     setPistaInput("");
     setJaVotei(false);
+    setTurnoModalDisp(false);
   }, []);
 
   useEffect(() => {
@@ -154,14 +154,16 @@ export default function App() {
       setErro("Esta sessão foi aberta em outro dispositivo ou aba.");
     });
     s.on("estadoSala", applyEstado);
-    s.on("rodadaIniciada", () => {
+    s.on("rodadaIniciada", (payload) => {
       setRodadaAtiva(true);
       setResultadoOverlayFechado(false);
       setPodeVerPalavra(true);
       setJaVotei(false);
+      if (payload?.fasePistas) {
+        return;
+      }
       if (!donoRef.current) {
         setRevelacao(null);
-        setClicouVerPalavra(false);
       }
     });
     s.on("rodadaEncerrada", () => {
@@ -206,6 +208,7 @@ export default function App() {
 
   const fase = sala?.faseRodada ?? null;
   const meuSessionId = ensureSessionId();
+  const jaViramPalavra = Boolean(sala?.viramPalavraIds?.includes(meuSessionId));
   const minhaVezPista = Boolean(
     rodadaAtiva &&
       fase === "pistas" &&
@@ -216,14 +219,16 @@ export default function App() {
   const prevMinhaVezRef = useRef(false);
   useEffect(() => {
     if (minhaVezPista && !prevMinhaVezRef.current) {
+      setTurnoModalDisp(false);
       try {
-        navigator.vibrate?.([80, 45, 80, 45, 120]);
+        navigator.vibrate?.([90, 55, 90, 55, 120, 55, 160]);
       } catch {
         /* ignore */
       }
     }
+    if (!minhaVezPista) setTurnoModalDisp(false);
     prevMinhaVezRef.current = minhaVezPista;
-  }, [minhaVezPista]);
+  }, [minhaVezPista, sala?.jogadorDaVezId]);
 
   const salvarNomePorCliente = (nomeSalvo) => {
     const k = nomePorClienteStorageKey(clienteChaveRef.current);
@@ -285,7 +290,6 @@ export default function App() {
         setPodeVerPalavra(true);
         if (!res.voceEhDono) {
           setRevelacao(null);
-          setClicouVerPalavra(false);
         }
       }
     });
@@ -312,7 +316,6 @@ export default function App() {
         return;
       }
       setRevelacao(res.revelacao);
-      setClicouVerPalavra(true);
     });
   };
 
@@ -540,17 +543,6 @@ export default function App() {
           )
         ) : (
           <section className="card glass sala">
-            {minhaVezPista && (
-              <div className="turn-overlay" role="alert" aria-live="assertive">
-                <div className="turn-panel">
-                  <p className="turn-kicker">Rodada de pistas</p>
-                  <h2 className="turn-title">É a sua vez</h2>
-                  <p className="turn-sub">
-                    Digite <strong>uma palavra</strong> no campo abaixo e envie — todos vão ver.
-                  </p>
-                </div>
-              </div>
-            )}
             <div className="sala-top">
               <div className="sala-top-codigo">
                 <p className="label">Código da sala</p>
@@ -572,10 +564,16 @@ export default function App() {
             </div>
 
             <p className="hint">
-              Mínimo de 3 jogadores para gerar palavra. Máximo 10 na sala. Após liberar a
-              palavra, cada um diz {PALAVRAS_POR_JOGADOR} pistas ({PALAVRAS_POR_JOGADOR}{" "}
-              palavras), um de cada vez, em ordem sorteada.
+              Mínimo de 3 jogadores para gerar palavra. Máximo 10 na sala. Depois de gerar, todos
+              devem ver a palavra (ou o papel de impostor); só então começam as pistas —{" "}
+              {PALAVRAS_POR_JOGADOR} palavras por pessoa, uma de cada vez.
             </p>
+            {voceEhDono && rodadaAtiva && fase === "revelacao" && (
+              <p className="hint revelacao-wait">
+                Aguardando todos verem: {sala?.viramPalavraIds?.length ?? 0}/
+                {sala?.totalJogadores ?? 0}
+              </p>
+            )}
 
             <div className="lista-jogadores">
               <p className="label">Jogadores ({sala?.jogadores?.length ?? 0})</p>
@@ -715,9 +713,9 @@ export default function App() {
                   type="button"
                   className="btn secondary block"
                   onClick={verPalavra}
-                  disabled={!podeVerPalavra || clicouVerPalavra}
+                  disabled={!podeVerPalavra || jaViramPalavra}
                 >
-                  Ver palavra
+                  {jaViramPalavra ? "Já viu a palavra" : "Ver palavra"}
                 </button>
               )}
             </div>
@@ -729,7 +727,7 @@ export default function App() {
               {revelacao?.tipo === "impostor" && (
                 <p className="destaque impostor">Você é o impostor.</p>
               )}
-              {voceEhDono && rodadaAtiva && !revelacao && fase !== "resultado" && (
+              {voceEhDono && rodadaAtiva && !revelacao && fase !== "resultado" && fase !== "revelacao" && (
                 <p className="hint center">Gerando…</p>
               )}
             </div>
@@ -798,6 +796,38 @@ export default function App() {
           </section>
         )}
       </main>
+
+      {minhaVezPista && sala && !turnoModalDisp && (
+        <div
+          className="turn-modal-root"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="turn-modal-title"
+        >
+          <div
+            className="turn-modal-backdrop"
+            aria-hidden
+            onClick={() => setTurnoModalDisp(true)}
+          />
+          <div className="turn-modal-card">
+            <p className="turn-kicker">Rodada de pistas</p>
+            <h2 id="turn-modal-title" className="turn-title">
+              É a sua vez
+            </h2>
+            <p className="turn-sub">
+              Role um pouco se precisar: use o campo <strong>«Sua pista…»</strong> no chat e envie{" "}
+              <strong>uma palavra</strong>. Todos vão ver na hora.
+            </p>
+            <button
+              type="button"
+              className="btn primary block turn-modal-ok"
+              onClick={() => setTurnoModalDisp(true)}
+            >
+              Entendi — enviar pista
+            </button>
+          </div>
+        </div>
+      )}
 
       <footer className="footer">
         <p>
@@ -1353,33 +1383,45 @@ export default function App() {
         .menu-acao {
           margin-top: 1rem;
         }
-        .turn-overlay {
-          position: fixed;
-          left: 0;
-          right: 0;
-          bottom: 0;
-          z-index: 45;
-          padding: 0.75rem 1rem calc(0.75rem + env(safe-area-inset-bottom, 0));
-          display: flex;
-          justify-content: center;
-          pointer-events: none;
+        .revelacao-wait {
+          text-align: center;
+          color: var(--accent);
+          font-weight: 600;
         }
-        .turn-panel {
-          pointer-events: none;
-          max-width: 520px;
+        .turn-modal-root {
+          position: fixed;
+          inset: 0;
+          z-index: 60;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          padding: 1rem;
+          padding-bottom: max(1rem, env(safe-area-inset-bottom, 0));
+        }
+        .turn-modal-backdrop {
+          position: absolute;
+          inset: 0;
+          background: rgba(4, 4, 10, 0.82);
+          backdrop-filter: blur(6px);
+        }
+        .turn-modal-card {
+          position: relative;
+          max-width: 400px;
           width: 100%;
-          padding: 1rem 1.15rem 1.1rem;
-          border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+          padding: 1.5rem 1.35rem 1.4rem;
+          border-radius: var(--radius-lg);
           border: 2px solid var(--accent);
-          border-bottom: none;
           background: linear-gradient(
-            180deg,
-            rgba(6, 6, 12, 0.97) 0%,
-            rgba(20, 8, 28, 0.95) 100%
+            165deg,
+            rgba(12, 12, 22, 0.98) 0%,
+            rgba(28, 10, 32, 0.98) 100%
           );
-          box-shadow: 0 -8px 48px rgba(0, 232, 255, 0.35), 0 0 0 1px rgba(255, 45, 139, 0.35) inset,
-            0 0 80px rgba(255, 45, 139, 0.15);
+          box-shadow: 0 0 0 1px rgba(255, 45, 139, 0.4) inset, 0 8px 48px rgba(0, 232, 255, 0.35),
+            0 0 120px rgba(255, 45, 139, 0.12);
           animation: turn-pulse 1.25s ease-in-out infinite;
+        }
+        .turn-modal-ok {
+          margin-top: 1.1rem;
         }
         @keyframes turn-pulse {
           0%,
