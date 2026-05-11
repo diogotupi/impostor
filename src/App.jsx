@@ -9,6 +9,25 @@ function socketUrl() {
   return SOCKET_URL || window.location.origin;
 }
 
+const ROOM_STORAGE_KEY = "impostor-sala-atual";
+const SESSION_STORAGE_KEY = "impostor-session-id";
+
+function ensureSessionId() {
+  try {
+    let id = localStorage.getItem(SESSION_STORAGE_KEY);
+    if (!id || id.length < 8) {
+      id =
+        typeof crypto !== "undefined" && crypto.randomUUID
+          ? crypto.randomUUID()
+          : `s-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+      localStorage.setItem(SESSION_STORAGE_KEY, id);
+    }
+    return id;
+  } catch {
+    return `s-${Date.now()}`;
+  }
+}
+
 const PALAVRAS_POR_JOGADOR = 3;
 
 export default function App() {
@@ -16,7 +35,6 @@ export default function App() {
   const [codigoEntrada, setCodigoEntrada] = useState("");
   const [erro, setErro] = useState("");
   const [socket, setSocket] = useState(null);
-  const [meuId, setMeuId] = useState(null);
   const [conectado, setConectado] = useState(false);
   const [sala, setSala] = useState(null);
   const [voceEhDono, setVoceEhDono] = useState(false);
@@ -51,7 +69,14 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const s = io(socketUrl(), { transports: ["websocket", "polling"] });
+    const s = io(socketUrl(), {
+      transports: ["websocket", "polling"],
+      reconnection: true,
+      reconnectionAttempts: Infinity,
+      reconnectionDelay: 800,
+      reconnectionDelayMax: 15000,
+      timeout: 60000,
+    });
     setSocket(s);
 
     const applyEstado = (estado) => {
@@ -64,17 +89,49 @@ export default function App() {
         faseAnteriorRef.current = null;
       } else {
         faseAnteriorRef.current = faseNova ?? null;
+        setRodadaAtiva(true);
+        setPodeVerPalavra(true);
       }
+      const sid = ensureSessionId();
+      if (estado.donoId) setVoceEhDono(estado.donoId === sid);
       setSala(estado);
+    };
+
+    const retomarSalaSeHouver = () => {
+      const raw = localStorage.getItem(ROOM_STORAGE_KEY);
+      const codigo = String(raw ?? "")
+        .trim()
+        .toUpperCase()
+        .replace(/[^A-Z0-9]/g, "");
+      if (codigo.length !== 6) return;
+      const sessionId = ensureSessionId();
+      const nomeRetomada = localStorage.getItem("impostor-nome") || "";
+      s.emit(
+        "entrarSala",
+        { codigo, nome: nomeRetomada, sessionId },
+        (res) => {
+          if (!res?.ok) {
+            localStorage.removeItem(ROOM_STORAGE_KEY);
+            return;
+          }
+          applyEstado(res.estado);
+        },
+      );
     };
 
     s.on("connect", () => {
       setConectado(true);
-      setMeuId(s.id);
+      retomarSalaSeHouver();
     });
     s.on("disconnect", () => {
       setConectado(false);
-      setMeuId(null);
+    });
+    s.on("sessaoSubstituida", () => {
+      localStorage.removeItem(ROOM_STORAGE_KEY);
+      setSala(null);
+      setVoceEhDono(false);
+      limparRodadaUi();
+      setErro("Esta sessão foi aberta em outro dispositivo ou aba.");
     });
     s.on("estadoSala", applyEstado);
     s.on("rodadaIniciada", () => {
@@ -92,11 +149,19 @@ export default function App() {
     });
     s.on("revelacao", (rev) => setRevelacao(rev));
     s.on("saiuDaSala", () => {
+      localStorage.removeItem(ROOM_STORAGE_KEY);
       setSala(null);
       setVoceEhDono(false);
       limparRodadaUi();
     });
+
+    const onVis = () => {
+      if (document.visibilityState === "visible" && !s.connected) s.connect();
+    };
+    document.addEventListener("visibilitychange", onVis);
+
     return () => {
+      document.removeEventListener("visibilitychange", onVis);
       s.removeAllListeners();
       s.close();
     };
@@ -123,11 +188,13 @@ export default function App() {
       setErro("Aguardando conexão…");
       return;
     }
-    socket.emit("criarSala", { nome }, (res) => {
+    const sessionId = ensureSessionId();
+    socket.emit("criarSala", { nome, sessionId }, (res) => {
       if (!res?.ok) {
         setErro(res?.erro || "Não foi possível criar a sala.");
         return;
       }
+      localStorage.setItem(ROOM_STORAGE_KEY, res.codigo);
       setSala(res.estado);
       setVoceEhDono(true);
       limparRodadaUi();
@@ -145,11 +212,13 @@ export default function App() {
       setErro("Digite o código de 6 caracteres.");
       return;
     }
-    socket.emit("entrarSala", { codigo: c, nome }, (res) => {
+    const sessionId = ensureSessionId();
+    socket.emit("entrarSala", { codigo: c, nome, sessionId }, (res) => {
       if (!res?.ok) {
         setErro(res?.erro || "Não foi possível entrar.");
         return;
       }
+      localStorage.setItem(ROOM_STORAGE_KEY, c);
       setSala(res.estado);
       setVoceEhDono(!!res.voceEhDono);
       if (!res.estado?.rodadaAtiva) limparRodadaUi();
@@ -198,6 +267,7 @@ export default function App() {
 
   const sairSala = () => {
     setErro("");
+    localStorage.removeItem(ROOM_STORAGE_KEY);
     socket.emit("sairSala");
     setSala(null);
     setVoceEhDono(false);
@@ -244,8 +314,12 @@ export default function App() {
   };
 
   const fase = sala?.faseRodada ?? null;
+  const meuSessionId = ensureSessionId();
   const minhaVezPista = Boolean(
-    rodadaAtiva && fase === "pistas" && sala?.jogadorDaVezId && meuId === sala.jogadorDaVezId,
+    rodadaAtiva &&
+      fase === "pistas" &&
+      sala?.jogadorDaVezId &&
+      meuSessionId === sala.jogadorDaVezId,
   );
   const resultado = sala?.resultado ?? null;
   const nomeJogador = (id) =>
@@ -287,14 +361,27 @@ export default function App() {
   return (
     <div className="app">
       <header className="header">
-        <h1 className="logo">Impostor</h1>
-        <p className="tagline">Uma palavra em comum — menos para um de vocês.</p>
-        {!conectado && <span className="badge warn">Conectando…</span>}
+        <p className="eyebrow">
+          <span className="slash">/</span> salas em tempo real <span className="slash">/</span>
+        </p>
+        <h1 className="logo">
+          <span className="logo-core">Impostor</span>
+        </h1>
+        <p className="tagline">
+          Uma palavra em comum <span className="tagline-slash">/</span>{" "}
+          <span className="tagline-accent">menos para um</span> de vocês
+        </p>
+        {!conectado && (
+          <span className="badge warn">
+            <span className="badge-dot" aria-hidden />
+            Conectando…
+          </span>
+        )}
       </header>
 
       <main className="main wide">
         {entrarLobby ? (
-          <section className="card">
+          <section className="card glass">
             <label className="label" htmlFor="nome">
               Seu nome (opcional)
             </label>
@@ -337,7 +424,7 @@ export default function App() {
             {erro && <p className="erro">{erro}</p>}
           </section>
         ) : (
-          <section className="card sala">
+          <section className="card glass sala">
             <div className="sala-top">
               <div className="sala-top-codigo">
                 <p className="label">Código da sala</p>
@@ -370,6 +457,7 @@ export default function App() {
                 {sala?.jogadores?.map((j) => (
                   <li key={j.id}>
                     {j.nome}
+                    {j.online === false ? <span className="pill warn">Ausente</span> : null}
                     {j.dono ? <span className="pill">Dono</span> : null}
                     {fase === "pistas" && rodadaAtiva && (
                       <span className="pill faint">
@@ -586,7 +674,10 @@ export default function App() {
       </main>
 
       <footer className="footer">
-        <p>Jogue presencialmente: conversem, votem, divirtam-se.</p>
+        <p>
+          <span className="footer-slash">/</span> jogue presencialmente — conversem, votem, divirtam-se{" "}
+          <span className="footer-slash">/</span>
+        </p>
       </footer>
 
       <style>{`
@@ -595,35 +686,88 @@ export default function App() {
           display: flex;
           flex-direction: column;
           align-items: center;
-          padding: 1.5rem 1rem 2rem;
+          padding: 1.75rem 1rem 2.5rem;
+          position: relative;
         }
         .header {
           text-align: center;
-          margin-bottom: 1.5rem;
-          max-width: 420px;
+          margin-bottom: 1.75rem;
+          max-width: 520px;
+        }
+        .eyebrow {
+          margin: 0 0 0.5rem;
+          font-family: var(--font-mono);
+          font-size: 0.7rem;
+          font-weight: 500;
+          letter-spacing: 0.28em;
+          text-transform: uppercase;
+          color: var(--muted);
+        }
+        .slash {
+          color: var(--accent);
+          font-weight: 600;
+          opacity: 0.9;
         }
         .logo {
           margin: 0;
-          font-size: 1.75rem;
-          font-weight: 700;
-          letter-spacing: -0.02em;
+          font-size: clamp(2.1rem, 6vw, 2.75rem);
+          font-weight: 800;
+          letter-spacing: 0.06em;
+          text-transform: uppercase;
+          line-height: 1.05;
+        }
+        .logo-core {
+          display: inline-block;
+          background: linear-gradient(105deg, #ffffff 0%, var(--accent) 42%, var(--magenta) 88%);
+          -webkit-background-clip: text;
+          background-clip: text;
+          color: transparent;
+          text-shadow: 0 0 40px rgba(0, 232, 255, 0.25);
         }
         .tagline {
-          margin: 0.35rem 0 0;
+          margin: 0.6rem 0 0;
           color: var(--muted);
-          font-size: 0.95rem;
+          font-size: 0.92rem;
+          font-weight: 500;
+          max-width: 28ch;
+          margin-left: auto;
+          margin-right: auto;
+        }
+        .tagline-slash {
+          color: var(--magenta);
+          font-weight: 700;
+          margin: 0 0.15rem;
+        }
+        .tagline-accent {
+          color: var(--accent);
+          font-weight: 700;
         }
         .badge {
-          display: inline-block;
-          margin-top: 0.5rem;
-          font-size: 0.75rem;
-          padding: 0.2rem 0.5rem;
+          display: inline-flex;
+          align-items: center;
+          gap: 0.45rem;
+          margin-top: 0.65rem;
+          font-family: var(--font-mono);
+          font-size: 0.72rem;
+          font-weight: 500;
+          padding: 0.35rem 0.75rem;
           border-radius: 999px;
-          background: var(--border);
+          border: 1px solid var(--border);
+          background: var(--card-solid);
+          color: var(--accent);
+          letter-spacing: 0.06em;
         }
-        .badge.warn {
-          background: #fef3c7;
-          color: #92400e;
+        .badge-dot {
+          width: 6px;
+          height: 6px;
+          border-radius: 50%;
+          background: var(--accent);
+          box-shadow: 0 0 10px var(--accent);
+          animation: pulse-dot 1.2s ease-in-out infinite;
+        }
+        @keyframes pulse-dot {
+          0%, 100% { opacity: 1; transform: scale(1); }
+          50% { opacity: 0.5; transform: scale(0.85); }
         }
         .main {
           width: 100%;
@@ -632,18 +776,43 @@ export default function App() {
         .main.wide {
           max-width: 520px;
         }
-        .card {
+        .card.glass {
           background: var(--card);
-          border-radius: var(--radius);
-          box-shadow: var(--shadow);
+          backdrop-filter: blur(14px);
+          -webkit-backdrop-filter: blur(14px);
+          border-radius: var(--radius-lg);
+          box-shadow: var(--shadow-card);
           border: 1px solid var(--border);
-          padding: 1.25rem 1.35rem;
+          padding: 1.35rem 1.4rem;
+          position: relative;
+          overflow: hidden;
+        }
+        .card.glass::before {
+          content: "";
+          position: absolute;
+          inset: 0;
+          border-radius: inherit;
+          padding: 1px;
+          background: linear-gradient(
+            135deg,
+            rgba(0, 232, 255, 0.35) 0%,
+            transparent 40%,
+            transparent 60%,
+            rgba(255, 45, 139, 0.25) 100%
+          );
+          -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+          mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+          -webkit-mask-composite: xor;
+          mask-composite: exclude;
+          pointer-events: none;
         }
         .card.sala .sala-top {
           display: flex;
           justify-content: space-between;
           align-items: flex-start;
           gap: 1rem;
+          position: relative;
+          z-index: 1;
         }
         .sala-top-codigo {
           min-width: 0;
@@ -658,32 +827,56 @@ export default function App() {
           flex-shrink: 0;
           padding-left: 0.85rem;
           padding-right: 0.85rem;
-          font-size: 0.85rem;
+          font-size: 0.75rem;
+          font-family: var(--font-mono);
+          text-transform: uppercase;
+          letter-spacing: 0.08em;
         }
         .codigo-grande {
           margin: 0;
-          font-size: 1.75rem;
+          font-family: var(--font-mono);
+          font-size: 1.6rem;
           font-weight: 700;
-          letter-spacing: 0.18em;
+          letter-spacing: 0.22em;
           font-variant-numeric: tabular-nums;
+          color: var(--text);
+          text-shadow: 0 0 24px rgba(0, 232, 255, 0.35);
         }
         .label {
           display: block;
-          font-size: 0.8rem;
+          font-family: var(--font-mono);
+          font-size: 0.72rem;
           font-weight: 600;
+          letter-spacing: 0.12em;
+          text-transform: uppercase;
           color: var(--muted);
-          margin-bottom: 0.35rem;
+          margin-bottom: 0.4rem;
+        }
+        .label::before {
+          content: "/ ";
+          color: var(--accent);
+          opacity: 0.7;
         }
         .input {
           width: 100%;
-          padding: 0.65rem 0.75rem;
+          padding: 0.7rem 0.85rem;
           border: 1px solid var(--border);
-          border-radius: 8px;
-          font-size: 1rem;
+          border-radius: var(--radius);
+          font-size: 0.9rem;
+          background: rgba(6, 6, 10, 0.65);
+          color: var(--text);
+          transition: border-color 0.15s, box-shadow 0.15s;
+        }
+        .input::placeholder {
+          color: rgba(139, 139, 158, 0.55);
         }
         .input:focus {
-          outline: 2px solid var(--accent);
-          outline-offset: 1px;
+          outline: none;
+          border-color: var(--accent);
+          box-shadow: 0 0 0 3px var(--accent-dim), 0 0 20px rgba(0, 232, 255, 0.12);
+        }
+        .input:disabled {
+          opacity: 0.5;
         }
         .row {
           display: flex;
@@ -695,61 +888,81 @@ export default function App() {
         }
         .btn {
           border: none;
-          border-radius: 8px;
-          padding: 0.65rem 1rem;
-          font-size: 0.95rem;
-          font-weight: 600;
+          border-radius: var(--radius);
+          padding: 0.7rem 1rem;
+          font-size: 0.88rem;
+          font-weight: 700;
+          letter-spacing: 0.04em;
+          text-transform: uppercase;
+          transition: transform 0.12s, box-shadow 0.12s, background 0.12s;
         }
         .btn.block {
           width: 100%;
         }
         .btn.primary {
-          background: var(--accent);
-          color: white;
+          background: linear-gradient(145deg, var(--accent) 0%, #00b8d4 50%, #0090a8 100%);
+          color: #050508;
+          box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.2) inset, 0 4px 20px rgba(0, 232, 255, 0.25);
         }
         .btn.primary:hover:not(:disabled) {
-          background: var(--accent-hover);
+          transform: translateY(-1px);
+          box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.28) inset, 0 6px 28px rgba(0, 232, 255, 0.35);
         }
         .btn.secondary {
-          background: #e0f2f1;
-          color: #115e59;
+          background: var(--magenta-dim);
+          color: #ffc8e4;
+          border: 1px solid var(--border-hot);
+          box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.06) inset;
         }
         .btn.secondary:hover:not(:disabled) {
-          background: #ccfbf1;
+          background: rgba(255, 45, 139, 0.28);
+          color: #fff;
         }
         .btn.danger {
-          background: #fef2f2;
-          color: var(--danger);
-          border: 1px solid #fecaca;
+          background: var(--danger-dim);
+          color: #ff8ba0;
+          border: 1px solid rgba(255, 61, 104, 0.45);
         }
         .btn.danger:hover:not(:disabled) {
-          background: #fee2e2;
+          background: rgba(255, 61, 104, 0.22);
+          color: #ffb3c0;
         }
         .btn.ghost {
           background: transparent;
           color: var(--muted);
-          border: 1px solid var(--border);
+          border: 1px solid var(--chrome-line);
+          text-transform: none;
+          font-weight: 600;
         }
         .btn.ghost:hover:not(:disabled) {
-          background: var(--bg);
+          border-color: var(--accent);
+          color: var(--accent);
+          background: var(--accent-dim);
         }
         .divider {
           height: 1px;
-          background: var(--border);
-          margin: 1.1rem 0;
+          margin: 1.25rem 0;
+          background: linear-gradient(90deg, transparent, var(--border), var(--border-hot), transparent);
+          opacity: 0.9;
         }
         .hint {
-          font-size: 0.85rem;
+          font-size: 0.82rem;
           color: var(--muted);
-          margin: 0.5rem 0 0;
+          margin: 0.55rem 0 0;
+          line-height: 1.45;
         }
         .hint.center {
           text-align: center;
         }
         .erro {
-          color: var(--danger);
-          font-size: 0.9rem;
-          margin: 0.75rem 0 0;
+          color: #ff7a94;
+          font-family: var(--font-mono);
+          font-size: 0.82rem;
+          margin: 0.85rem 0 0;
+        }
+        .lista-jogadores {
+          position: relative;
+          z-index: 1;
         }
         .lista-jogadores ul {
           list-style: none;
@@ -757,41 +970,56 @@ export default function App() {
           margin: 0.25rem 0 0;
         }
         .lista-jogadores li {
-          padding: 0.35rem 0;
-          border-bottom: 1px solid var(--border);
+          padding: 0.45rem 0;
+          border-bottom: 1px solid rgba(0, 232, 255, 0.08);
           display: flex;
           align-items: center;
           gap: 0.5rem;
           flex-wrap: wrap;
+          font-weight: 600;
         }
         .pill {
-          font-size: 0.7rem;
+          font-family: var(--font-mono);
+          font-size: 0.65rem;
           font-weight: 600;
-          background: #e0f2f1;
-          color: #0f766e;
-          padding: 0.15rem 0.45rem;
-          border-radius: 999px;
+          letter-spacing: 0.04em;
+          text-transform: uppercase;
+          background: var(--accent-dim);
+          color: var(--accent);
+          padding: 0.2rem 0.5rem;
+          border-radius: 4px;
+          border: 1px solid var(--border);
         }
         .pill.faint {
-          background: #f5f5f4;
+          background: rgba(255, 255, 255, 0.04);
           color: var(--muted);
+          border-color: var(--chrome-line);
+        }
+        .pill.warn {
+          background: rgba(255, 180, 70, 0.12);
+          color: #ffc46b;
+          border-color: rgba(255, 180, 70, 0.35);
         }
         .chat {
-          margin-top: 1rem;
+          margin-top: 1.1rem;
           border: 1px solid var(--border);
-          border-radius: 10px;
-          padding: 0.75rem;
-          background: #fafaf9;
+          border-radius: var(--radius-lg);
+          padding: 0.85rem;
+          background: rgba(6, 6, 10, 0.55);
+          position: relative;
+          z-index: 1;
         }
         .chat-log {
           max-height: 220px;
           overflow-y: auto;
-          font-size: 0.9rem;
+          font-size: 0.88rem;
           margin-bottom: 0.65rem;
+          font-family: var(--font-mono);
+          scrollbar-color: var(--accent-dim) transparent;
         }
         .msg {
-          padding: 0.35rem 0;
-          border-bottom: 1px solid var(--border);
+          padding: 0.4rem 0;
+          border-bottom: 1px solid rgba(255, 255, 255, 0.05);
         }
         .msg:last-child {
           border-bottom: none;
@@ -799,11 +1027,11 @@ export default function App() {
         .msg.sistema {
           color: var(--muted);
           font-style: italic;
-          font-size: 0.85rem;
+          font-size: 0.8rem;
         }
         .msg-autor {
           font-weight: 600;
-          color: #44403c;
+          color: var(--accent);
         }
         .chat-form {
           display: flex;
@@ -814,9 +1042,11 @@ export default function App() {
           margin-bottom: 0.5rem;
         }
         .votacao {
-          margin-top: 1rem;
-          padding-top: 0.75rem;
-          border-top: 1px solid var(--border);
+          margin-top: 1.1rem;
+          padding-top: 0.9rem;
+          border-top: 1px solid rgba(255, 45, 139, 0.2);
+          position: relative;
+          z-index: 1;
         }
         .voto-lista {
           list-style: none;
@@ -824,15 +1054,18 @@ export default function App() {
           margin: 0.35rem 0 0;
         }
         .voto-lista li {
-          margin-bottom: 0.4rem;
+          margin-bottom: 0.45rem;
         }
         .voto-btn {
           text-align: left;
+          font-family: var(--font-mono);
+          font-size: 0.82rem;
         }
         .overlay {
           position: fixed;
           inset: 0;
-          background: rgba(28, 25, 23, 0.45);
+          background: rgba(4, 4, 8, 0.82);
+          backdrop-filter: blur(8px);
           display: flex;
           align-items: center;
           justify-content: center;
@@ -840,92 +1073,128 @@ export default function App() {
           padding: 1rem;
         }
         .overlay-card {
-          background: var(--card);
-          border-radius: var(--radius);
-          padding: 1.5rem;
+          background: var(--card-solid);
+          border-radius: var(--radius-lg);
+          padding: 1.6rem;
           max-width: 380px;
           width: 100%;
           border: 1px solid var(--border);
-          box-shadow: var(--shadow);
+          box-shadow: var(--shadow-card), 0 0 80px rgba(255, 45, 139, 0.08);
         }
         .overlay-head {
           display: flex;
           align-items: center;
           justify-content: center;
           position: relative;
-          margin-bottom: 0.75rem;
+          margin-bottom: 0.85rem;
         }
         .overlay-titulo {
           margin: 0;
-          font-size: 1.25rem;
+          font-size: 1.35rem;
+          font-weight: 800;
           text-align: center;
+          text-transform: uppercase;
+          letter-spacing: 0.08em;
+          background: linear-gradient(90deg, var(--text), var(--accent));
+          -webkit-background-clip: text;
+          background-clip: text;
+          color: transparent;
         }
         .btn-overlay-fechar {
           position: absolute;
           right: 0;
           top: 50%;
           transform: translateY(-50%);
-          width: 2.25rem;
-          height: 2.25rem;
+          width: 2.35rem;
+          height: 2.35rem;
           padding: 0;
-          border: none;
-          border-radius: 8px;
-          background: var(--bg);
+          border: 1px solid var(--border);
+          border-radius: var(--radius);
+          background: rgba(6, 6, 10, 0.8);
           color: var(--muted);
-          font-size: 1.5rem;
+          font-size: 1.4rem;
           line-height: 1;
           cursor: pointer;
+          transition: color 0.12s, border-color 0.12s;
         }
         .btn-overlay-fechar:hover {
-          background: var(--border);
-          color: var(--text);
+          border-color: var(--magenta);
+          color: var(--magenta);
         }
         .overlay-fechar-baixo {
           margin-top: 1rem;
         }
         .resultado-mini {
           margin-top: 0.75rem;
+          position: relative;
+          z-index: 1;
         }
         .overlay-texto {
-          margin: 0.5rem 0;
-          font-size: 0.95rem;
+          margin: 0.55rem 0;
+          font-size: 0.92rem;
+          color: #d4d4de;
+        }
+        .overlay-texto strong {
+          color: var(--accent);
         }
         .voto-resumo {
-          margin: 0.25rem 0 0;
+          margin: 0.35rem 0 0;
           padding-left: 1.1rem;
-          font-size: 0.9rem;
+          font-size: 0.88rem;
+          font-family: var(--font-mono);
+          color: var(--muted);
         }
         .acoes {
           margin-top: 1.25rem;
           display: flex;
           flex-direction: column;
           gap: 0.65rem;
+          position: relative;
+          z-index: 1;
         }
         .painel-revelacao {
           margin-top: 1.25rem;
           min-height: 3rem;
+          padding: 0.75rem;
+          border-radius: var(--radius);
+          border: 1px dashed rgba(0, 232, 255, 0.25);
+          background: rgba(0, 232, 255, 0.04);
+          position: relative;
+          z-index: 1;
         }
         .destaque {
           margin: 0;
           text-align: center;
-          font-size: 1.15rem;
-          font-weight: 600;
+          font-size: 1.05rem;
+          font-weight: 700;
+          font-family: var(--font-mono);
         }
         .destaque.palavra {
-          color: #0f766e;
+          color: var(--accent);
+          text-shadow: 0 0 20px rgba(0, 232, 255, 0.35);
         }
         .destaque.impostor {
-          color: var(--danger);
+          color: var(--magenta);
+          text-shadow: 0 0 24px rgba(255, 45, 139, 0.35);
         }
         .footer {
           margin-top: auto;
-          padding-top: 2rem;
+          padding-top: 2.25rem;
           text-align: center;
+          font-family: var(--font-mono);
+          font-size: 0.72rem;
+          letter-spacing: 0.1em;
+          text-transform: uppercase;
           color: var(--muted);
-          font-size: 0.8rem;
+          max-width: 36rem;
         }
         .footer p {
           margin: 0;
+          line-height: 1.6;
+        }
+        .footer-slash {
+          color: var(--accent);
+          opacity: 0.65;
         }
       `}</style>
     </div>

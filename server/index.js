@@ -14,12 +14,13 @@ const MIN_JOGADORES = 3;
 const MAX_JOGADORES = 10;
 const PALAVRAS_POR_JOGADOR = 3;
 const TEXTO_CHAT_MAX = 80;
+/** Tempo que o jogador permanece na sala sem socket (aba em segundo plano / rede instável). */
+const GRACE_MS = Number(process.env.SALA_GRACE_MS) || 8 * 60 * 1000;
 
 const app = express();
 app.use(cors({ origin: true, credentials: true }));
 
 /**
- * round:
  * @typedef {{
  *   word: string,
  *   impostorId: string,
@@ -39,7 +40,18 @@ app.use(cors({ origin: true, credentials: true }));
  * }} RoundState
  */
 
-/** @type {Map<string, { hostId: string, players: Map<string, { name: string }>, round: RoundState | null, lobbyMsgs: Array<{ autorId: string, autorNome: string, texto: string, ts: number }> }>} */
+/**
+ * @typedef {{
+ *   hostSessionId: string,
+ *   players: Map<string, { name: string }>,
+ *   sessionSocket: Map<string, string>,
+ *   disconnectTimers: Map<string, ReturnType<typeof setTimeout>>,
+ *   round: RoundState | null,
+ *   lobbyMsgs: Array<{ autorId: string, autorNome: string, texto: string, ts: number }>,
+ * }} SalaState
+ */
+
+/** @type {Map<string, SalaState>} */
 const salas = new Map();
 
 function codigoSala() {
@@ -47,6 +59,12 @@ function codigoSala() {
   let s = "";
   for (let i = 0; i < 6; i++) s += chars[Math.floor(Math.random() * chars.length)];
   return salas.has(s) ? codigoSala() : s;
+}
+
+function normalizarSessionId(s) {
+  const t = String(s ?? "").trim();
+  if (t.length < 8 || t.length > 120) return null;
+  return t;
 }
 
 function embaralhar(array) {
@@ -65,11 +83,11 @@ function jogadorDaVezId(round) {
 }
 
 /** @param {RoundState} round */
-function todasPistasCompletas(round, playerIds) {
-  return playerIds.every((id) => (round.contagemPalavras[id] ?? 0) >= PALAVRAS_POR_JOGADOR);
+function todasPistasCompletas(round, sessionIds) {
+  return sessionIds.every((id) => (round.contagemPalavras[id] ?? 0) >= PALAVRAS_POR_JOGADOR);
 }
 
-/** Após mensagem válida em pistas */
+/** @param {RoundState} round */
 function avancarTurnoPistas(round) {
   const ids = round.ordemTurno;
   const n = ids.length;
@@ -83,6 +101,61 @@ function avancarTurnoPistas(round) {
   }
   round.fase = "votacao";
   round.indiceTurno = 0;
+}
+
+/**
+ * Se quem deveria jogar está sem socket, passa o turno até alguém online ou fim da fase.
+ * @param {SalaState} sala
+ */
+function garantirTurnoComSocket(sala) {
+  const r = sala.round;
+  if (!r || r.fase !== "pistas") return;
+  if (sala.sessionSocket.size === 0) return;
+  let guard = 0;
+  while (guard++ <= r.ordemTurno.length + 2) {
+    const cur = jogadorDaVezId(r);
+    if (!cur) return;
+    if (sala.sessionSocket.has(cur)) return;
+    avancarTurnoPistas(r);
+    if (r.fase !== "pistas") {
+      if (r.fase === "votacao") {
+        r.mensagens.push({
+          tipo: "sistema",
+          texto: "Todos deram suas pistas. Vote em quem acha que é o impostor.",
+          ts: Date.now(),
+        });
+      }
+      return;
+    }
+  }
+}
+
+function cancelGraceTimer(sala, sessionId) {
+  const t = sala.disconnectTimers.get(sessionId);
+  if (t) clearTimeout(t);
+  sala.disconnectTimers.delete(sessionId);
+}
+
+/**
+ * @param {import("socket.io").Socket} socket
+ * @param {SalaState} sala
+ * @param {string} codigo
+ * @param {string} sessionId
+ */
+function anexarSocketASessao(socket, sala, codigo, sessionId) {
+  const prev = sala.sessionSocket.get(sessionId);
+  if (prev && prev !== socket.id) {
+    const oldSock = globalThis.__io?.sockets?.sockets?.get(prev);
+    if (oldSock) {
+      oldSock.emit("sessaoSubstituida");
+      oldSock.leave(codigo);
+      oldSock.data.impostor = undefined;
+    }
+  }
+  sala.sessionSocket.set(sessionId, socket.id);
+  socket.data.impostor = { codigo, sessionId };
+  socket.join(codigo);
+  cancelGraceTimer(sala, sessionId);
 }
 
 /** @param {RoundState} round */
@@ -114,21 +187,31 @@ function iniciarResultado(round, sala) {
   });
 }
 
+/** Todos os jogadores com socket ativo já votaram. */
+function todosOnlineJaVotaram(sala, round) {
+  for (const sess of sala.players.keys()) {
+    if (!sala.sessionSocket.has(sess)) continue;
+    if (!round.votos.has(sess)) return false;
+  }
+  return sala.sessionSocket.size > 0;
+}
+
 function estadoPublicoDaSala(codigo) {
   const sala = salas.get(codigo);
   if (!sala) return null;
   const jogadores = [];
-  for (const [id, p] of sala.players) {
+  for (const [sessionId, p] of sala.players) {
     jogadores.push({
-      id,
+      id: sessionId,
       nome: p.name,
-      dono: id === sala.hostId,
+      dono: sessionId === sala.hostSessionId,
+      online: sala.sessionSocket.has(sessionId),
     });
   }
 
   const extra = {
     lobbyMsgs: sala.round ? [] : sala.lobbyMsgs,
-    faseRodada: /** @type {null | 'pistas' | 'votacao' | 'resultado'} */ (null),
+    faseRodada: /** @type {null | "pistas" | "votacao" | "resultado"} */ (null),
     jogadorDaVezId: /** @type {string | null} */ (null),
     contagemPalavras: /** @type {Record<string, number>} */ ({}),
     mensagensRodada: /** @type {Array<{ tipo: string, texto: string, autorId?: string, autorNome?: string, ts: number }>} */ (
@@ -146,14 +229,15 @@ function estadoPublicoDaSala(codigo) {
     extra.mensagensRodada = [...r.mensagens];
     extra.resultado = r.resultado;
     if (r.fase === "votacao") {
-      extra.votacao = { recebidos: r.votos.size, total: sala.players.size };
+      const online = [...sala.players.keys()].filter((s) => sala.sessionSocket.has(s)).length;
+      extra.votacao = { recebidos: r.votos.size, total: Math.max(online, 1) };
     }
   }
 
   return {
     codigo,
     jogadores,
-    donoId: sala.hostId,
+    donoId: sala.hostSessionId,
     rodadaAtiva: !!sala.round,
     totalJogadores: sala.players.size,
     podeGerarPalavra:
@@ -172,9 +256,10 @@ function broadcastEstado(codigo) {
   io.to(codigo).emit("estadoSala", base);
 }
 
-function revelarParaSocket(socket, sala) {
+/** @param {string} sessionId */
+function revelarParaSessao(sessionId, sala) {
   if (!sala.round) return { tipo: "aguardando" };
-  if (socket.id === sala.round.impostorId) return { tipo: "impostor" };
+  if (sessionId === sala.round.impostorId) return { tipo: "impostor" };
   return { tipo: "palavra", palavra: sala.round.word };
 }
 
@@ -187,9 +272,71 @@ function normalizarUmaPalavra(texto) {
   return primeira.slice(0, TEXTO_CHAT_MAX);
 }
 
+/**
+ * Remove jogador: sessão, timers, ajusta host e rodada.
+ * @param {string} codigo
+ * @param {string} sessionId
+ */
+function removerJogadorDaSala(codigo, sessionId) {
+  const sala = salas.get(codigo);
+  if (!sala || !sala.players.has(sessionId)) return;
+
+  cancelGraceTimer(sala, sessionId);
+  sala.players.delete(sessionId);
+  sala.sessionSocket.delete(sessionId);
+
+  if (sala.players.size === 0) {
+    salas.delete(codigo);
+    return;
+  }
+
+  if (sala.hostSessionId === sessionId) {
+    sala.hostSessionId = sala.players.keys().next().value;
+  }
+
+  if (sala.round) {
+    const r = sala.round;
+    if (r.fase === "pistas") {
+      const ids = [...sala.players.keys()];
+      if (todasPistasCompletas(r, ids)) {
+        r.fase = "votacao";
+        r.mensagens.push({
+          tipo: "sistema",
+          texto: "Todos deram suas pistas. Vote em quem acha que é o impostor.",
+          ts: Date.now(),
+        });
+      } else {
+        garantirTurnoComSocket(sala);
+      }
+    }
+    r.votos.delete(sessionId);
+    for (const [v, alvo] of [...r.votos]) {
+      if (alvo === sessionId) r.votos.delete(v);
+    }
+  }
+
+  broadcastEstado(codigo);
+}
+
+function agendarRemocaoPorDesconexao(codigo, sessionId) {
+  const sala = salas.get(codigo);
+  if (!sala || !sala.players.has(sessionId)) return;
+
+  cancelGraceTimer(sala, sessionId);
+  const tid = setTimeout(() => {
+    sala.disconnectTimers.delete(sessionId);
+    if (sala.sessionSocket.has(sessionId)) return;
+    removerJogadorDaSala(codigo, sessionId);
+  }, GRACE_MS);
+  sala.disconnectTimers.set(sessionId, tid);
+}
+
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: true, credentials: true },
+  pingInterval: 25000,
+  pingTimeout: 120000,
+  connectTimeout: 60000,
 });
 globalThis.__io = io;
 
@@ -205,63 +352,38 @@ io.on("connection", (socket) => {
   /** @type {string | null} */
   let salaAtual = null;
 
-  function sairDaSala() {
-    if (!salaAtual) return;
-    const sala = salas.get(salaAtual);
-    if (!sala) {
-      salaAtual = null;
-      return;
-    }
-    sala.players.delete(socket.id);
-    socket.leave(salaAtual);
-    const codigo = salaAtual;
-    if (sala.players.size === 0) {
-      salas.delete(codigo);
-    } else {
-      if (sala.hostId === socket.id) {
-        sala.hostId = sala.players.keys().next().value;
-      }
-      if (sala.round && sala.round.fase === "pistas") {
-        const ids = [...sala.players.keys()];
-        if (todasPistasCompletas(sala.round, ids)) {
-          sala.round.fase = "votacao";
-        } else {
-          while (
-            jogadorDaVezId(sala.round) &&
-            !sala.players.has(jogadorDaVezId(sala.round))
-          ) {
-            avancarTurnoPistas(sala.round);
-            if (sala.round.fase !== "pistas") break;
-          }
-        }
-      }
-      broadcastEstado(codigo);
-    }
+  function sairDaSalaExplicito() {
+    const meta = socket.data.impostor;
+    if (!meta) return;
+    const { codigo, sessionId } = meta;
+    socket.leave(codigo);
+    socket.data.impostor = undefined;
+    removerJogadorDaSala(codigo, sessionId);
     salaAtual = null;
   }
 
   socket.on("disconnect", () => {
-    sairDaSala();
-  });
-
-  socket.on("criarSala", ({ nome }, cb) => {
-    sairDaSala();
-    const codigo = codigoSala();
-    const name = (nome || "Jogador").trim().slice(0, 24) || "Jogador";
-    salas.set(codigo, {
-      hostId: socket.id,
-      players: new Map([[socket.id, { name }]]),
-      round: null,
-      lobbyMsgs: [],
-    });
-    socket.join(codigo);
-    salaAtual = codigo;
+    const meta = socket.data.impostor;
+    if (!meta) return;
+    const { codigo, sessionId } = meta;
+    const sala = salas.get(codigo);
+    if (!sala) return;
+    if (sala.sessionSocket.get(sessionId) !== socket.id) return;
+    sala.sessionSocket.delete(sessionId);
+    socket.data.impostor = undefined;
+    garantirTurnoComSocket(sala);
+    agendarRemocaoPorDesconexao(codigo, sessionId);
     broadcastEstado(codigo);
-    const estado = estadoPublicoDaSala(codigo);
-    cb?.({ ok: true, codigo, estado, voceEhDono: true });
+    salaAtual = null;
   });
 
-  socket.on("entrarSala", ({ codigo, nome }, cb) => {
+  /**
+   * @param {string} codigo
+   * @param {string} sessionId
+   * @param {string} name
+   * @param {(r: any) => void} [cb]
+   */
+  function entrarOuRetomar(codigo, sessionId, name, cb) {
     const c = String(codigo || "")
       .trim()
       .toUpperCase()
@@ -270,19 +392,41 @@ io.on("connection", (socket) => {
       cb?.({ ok: false, erro: "Código inválido. Use 6 caracteres." });
       return;
     }
+    const sid = normalizarSessionId(sessionId);
+    if (!sid) {
+      cb?.({ ok: false, erro: "Identificador de sessão inválido. Atualize a página." });
+      return;
+    }
     const sala = salas.get(c);
     if (!sala) {
       cb?.({ ok: false, erro: "Sala não encontrada." });
       return;
     }
+    const nome = (name || "Jogador").trim().slice(0, 24) || "Jogador";
+
+    if (sala.players.has(sid)) {
+      sala.players.get(sid).name = nome;
+      anexarSocketASessao(socket, sala, c, sid);
+      salaAtual = c;
+      garantirTurnoComSocket(sala);
+      broadcastEstado(c);
+      const estado = estadoPublicoDaSala(c);
+      cb?.({
+        ok: true,
+        codigo: c,
+        estado,
+        voceEhDono: sid === sala.hostSessionId,
+      });
+      return;
+    }
+
     if (sala.players.size >= MAX_JOGADORES) {
       cb?.({ ok: false, erro: "Sala cheia (máximo 10 jogadores)." });
       return;
     }
-    sairDaSala();
-    const name = (nome || "Jogador").trim().slice(0, 24) || "Jogador";
-    sala.players.set(socket.id, { name });
-    socket.join(c);
+
+    sala.players.set(sid, { name: nome });
+    anexarSocketASessao(socket, sala, c, sid);
     salaAtual = c;
     broadcastEstado(c);
     const estado = estadoPublicoDaSala(c);
@@ -290,16 +434,62 @@ io.on("connection", (socket) => {
       ok: true,
       codigo: c,
       estado,
-      voceEhDono: socket.id === sala.hostId,
+      voceEhDono: sid === sala.hostSessionId,
     });
+  }
+
+  socket.on("criarSala", ({ nome, sessionId }, cb) => {
+    const meta = socket.data.impostor;
+    if (meta?.codigo) {
+      socket.leave(meta.codigo);
+      socket.data.impostor = undefined;
+      removerJogadorDaSala(meta.codigo, meta.sessionId);
+    }
+    const sid = normalizarSessionId(sessionId);
+    if (!sid) {
+      cb?.({ ok: false, erro: "Identificador de sessão inválido. Atualize a página." });
+      return;
+    }
+    const codigo = codigoSala();
+    const name = (nome || "Jogador").trim().slice(0, 24) || "Jogador";
+    salas.set(codigo, {
+      hostSessionId: sid,
+      players: new Map([[sid, { name }]]),
+      sessionSocket: new Map(),
+      disconnectTimers: new Map(),
+      round: null,
+      lobbyMsgs: [],
+    });
+    const sala = salas.get(codigo);
+    anexarSocketASessao(socket, sala, codigo, sid);
+    salaAtual = codigo;
+    broadcastEstado(codigo);
+    cb?.({ ok: true, codigo, estado: estadoPublicoDaSala(codigo), voceEhDono: true });
+  });
+
+  socket.on("entrarSala", ({ codigo, nome, sessionId }, cb) => {
+    const prev = socket.data.impostor;
+    if (prev?.codigo) {
+      socket.leave(prev.codigo);
+      socket.data.impostor = undefined;
+      const s = salas.get(prev.codigo);
+      if (s?.sessionSocket.get(prev.sessionId) === socket.id) {
+        s.sessionSocket.delete(prev.sessionId);
+        garantirTurnoComSocket(s);
+        agendarRemocaoPorDesconexao(prev.codigo, prev.sessionId);
+        broadcastEstado(prev.codigo);
+      }
+    }
+    entrarOuRetomar(codigo, sessionId, nome, cb);
   });
 
   socket.on("chatLobby", ({ texto }, cb) => {
-    if (!salaAtual) {
+    const meta = socket.data.impostor;
+    if (!meta) {
       cb?.({ ok: false, erro: "Você não está em uma sala." });
       return;
     }
-    const sala = salas.get(salaAtual);
+    const sala = salas.get(meta.codigo);
     if (!sala || sala.round) {
       cb?.({ ok: false, erro: "Chat livre só antes da rodada." });
       return;
@@ -309,25 +499,28 @@ io.on("connection", (socket) => {
       cb?.({ ok: false, erro: "Mensagem vazia." });
       return;
     }
-    const p = sala.players.get(socket.id);
+    const sid = meta.sessionId;
+    const p = sala.players.get(sid);
     sala.lobbyMsgs.push({
-      autorId: socket.id,
+      autorId: sid,
       autorNome: p?.name ?? "Jogador",
       texto: t,
       ts: Date.now(),
     });
     if (sala.lobbyMsgs.length > 200) sala.lobbyMsgs.splice(0, sala.lobbyMsgs.length - 200);
-    broadcastEstado(salaAtual);
+    broadcastEstado(meta.codigo);
     cb?.({ ok: true });
   });
 
   socket.on("gerarPalavra", (cb) => {
-    if (!salaAtual) {
+    const meta = socket.data.impostor;
+    if (!meta) {
       cb?.({ ok: false, erro: "Você não está em uma sala." });
       return;
     }
-    const sala = salas.get(salaAtual);
-    if (!sala || sala.hostId !== socket.id) {
+    const sala = salas.get(meta.codigo);
+    const sid = meta.sessionId;
+    if (!sala || sala.hostSessionId !== sid) {
       cb?.({ ok: false, erro: "Apenas o dono da sala pode gerar a palavra." });
       return;
     }
@@ -373,25 +566,28 @@ io.on("connection", (socket) => {
       resultado: null,
     };
 
-    broadcastEstado(salaAtual);
-    const rev = revelarParaSocket(socket, sala);
-    io.to(salaAtual).emit("rodadaIniciada", { podeVerPalavra: true });
+    const c = meta.codigo;
+    broadcastEstado(c);
+    const rev = revelarParaSessao(sid, sala);
+    io.to(c).emit("rodadaIniciada", { podeVerPalavra: true });
     socket.emit("revelacao", rev);
     cb?.({ ok: true, revelacao: rev });
   });
 
   socket.on("enviarPista", ({ texto }, cb) => {
-    if (!salaAtual) {
+    const meta = socket.data.impostor;
+    if (!meta) {
       cb?.({ ok: false, erro: "Você não está em uma sala." });
       return;
     }
-    const sala = salas.get(salaAtual);
+    const sala = salas.get(meta.codigo);
+    const sid = meta.sessionId;
     if (!sala?.round || sala.round.fase !== "pistas") {
       cb?.({ ok: false, erro: "Não é hora de pistas." });
       return;
     }
     const ativo = jogadorDaVezId(sala.round);
-    if (socket.id !== ativo) {
+    if (sid !== ativo) {
       cb?.({ ok: false, erro: "Aguarde a sua vez." });
       return;
     }
@@ -400,13 +596,12 @@ io.on("connection", (socket) => {
       cb?.({ ok: false, erro: "Digite uma palavra." });
       return;
     }
-    const p = sala.players.get(socket.id);
+    const p = sala.players.get(sid);
     const nome = p?.name ?? "Jogador";
-    sala.round.contagemPalavras[socket.id] =
-      (sala.round.contagemPalavras[socket.id] ?? 0) + 1;
+    sala.round.contagemPalavras[sid] = (sala.round.contagemPalavras[sid] ?? 0) + 1;
     sala.round.mensagens.push({
       tipo: "pista",
-      autorId: socket.id,
+      autorId: sid,
       autorNome: nome,
       texto: palavra,
       ts: Date.now(),
@@ -422,63 +617,70 @@ io.on("connection", (socket) => {
       });
     } else {
       avancarTurnoPistas(sala.round);
+      garantirTurnoComSocket(sala);
     }
 
-    broadcastEstado(salaAtual);
+    broadcastEstado(meta.codigo);
     cb?.({ ok: true });
   });
 
   socket.on("votar", ({ alvoId }, cb) => {
-    if (!salaAtual) {
+    const meta = socket.data.impostor;
+    if (!meta) {
       cb?.({ ok: false, erro: "Você não está em uma sala." });
       return;
     }
-    const sala = salas.get(salaAtual);
+    const sala = salas.get(meta.codigo);
+    const sid = meta.sessionId;
     if (!sala?.round || sala.round.fase !== "votacao") {
       cb?.({ ok: false, erro: "Votação não está aberta." });
       return;
     }
     const alvo = String(alvoId || "");
-    if (!sala.players.has(socket.id) || !sala.players.has(alvo)) {
+    if (!sala.players.has(sid) || !sala.players.has(alvo)) {
       cb?.({ ok: false, erro: "Voto inválido." });
       return;
     }
-    sala.round.votos.set(socket.id, alvo);
-    broadcastEstado(salaAtual);
+    sala.round.votos.set(sid, alvo);
+    broadcastEstado(meta.codigo);
 
-    if (sala.round.votos.size === sala.players.size) {
+    if (todosOnlineJaVotaram(sala, sala.round)) {
       iniciarResultado(sala.round, sala);
-      broadcastEstado(salaAtual);
+      broadcastEstado(meta.codigo);
     }
 
     cb?.({ ok: true });
   });
 
   socket.on("verPalavra", (cb) => {
-    if (!salaAtual) {
+    const meta = socket.data.impostor;
+    if (!meta) {
       cb?.({ ok: false, erro: "Você não está em uma sala." });
       return;
     }
-    const sala = salas.get(salaAtual);
+    const sala = salas.get(meta.codigo);
+    const sid = meta.sessionId;
     if (!sala || !sala.round) {
       cb?.({ ok: false, erro: "Ainda não há palavra nesta rodada." });
       return;
     }
-    if (socket.id === sala.hostId) {
+    if (sid === sala.hostSessionId) {
       cb?.({ ok: false, erro: "O dono já vê o resultado ao gerar a palavra." });
       return;
     }
-    const rev = revelarParaSocket(socket, sala);
+    const rev = revelarParaSessao(sid, sala);
     cb?.({ ok: true, revelacao: rev });
   });
 
   socket.on("finalizarPartida", (cb) => {
-    if (!salaAtual) {
+    const meta = socket.data.impostor;
+    if (!meta) {
       cb?.({ ok: false, erro: "Você não está em uma sala." });
       return;
     }
-    const sala = salas.get(salaAtual);
-    if (!sala || sala.hostId !== socket.id) {
+    const sala = salas.get(meta.codigo);
+    const sid = meta.sessionId;
+    if (!sala || sala.hostSessionId !== sid) {
       cb?.({ ok: false, erro: "Apenas o dono pode finalizar a partida." });
       return;
     }
@@ -487,13 +689,13 @@ io.on("connection", (socket) => {
       return;
     }
     sala.round = null;
-    io.to(salaAtual).emit("rodadaEncerrada");
-    broadcastEstado(salaAtual);
+    io.to(meta.codigo).emit("rodadaEncerrada");
+    broadcastEstado(meta.codigo);
     cb?.({ ok: true });
   });
 
   socket.on("sairSala", () => {
-    sairDaSala();
+    sairDaSalaExplicito();
     socket.emit("saiuDaSala");
   });
 });
