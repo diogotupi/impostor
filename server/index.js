@@ -28,6 +28,7 @@ app.use(cors({ origin: true, credentials: true }));
  *   fase: 'revelacao' | 'pistas' | 'votacao' | 'resultado',
  *   viramPalavra: Set<string>,
  *   ordemTurno: string[],
+ *   turnoAtualId: string | null,
  *   indiceTurno: number,
  *   contagemPalavras: Record<string, number>,
  *   mensagens: Array<{ tipo: 'sistema' | 'pista', texto: string, autorId?: string, autorNome?: string, ts: number }>,
@@ -50,6 +51,7 @@ app.use(cors({ origin: true, credentials: true }));
  *   disconnectTimers: Map<string, ReturnType<typeof setTimeout>>,
  *   round: RoundState | null,
  *   lobbyMsgs: Array<{ autorId: string, autorNome: string, texto: string, ts: number }>,
+ *   modoSala: 'online' | 'presencial',
  * }} SalaState
  */
 
@@ -119,10 +121,8 @@ function embaralhar(array) {
 /** @param {RoundState} round */
 function jogadorDaVezId(round) {
   if (round.fase !== "pistas") return null;
-  const ids = round.ordemTurno;
-  if (ids.length === 0) return null;
-  const i = Math.min(Math.max(0, round.indiceTurno), ids.length - 1);
-  return ids[i] ?? null;
+  const id = round.turnoAtualId;
+  return id ?? null;
 }
 
 /** Ordem de turno só com jogadores ainda na sala (mantém ordem relativa). */
@@ -136,8 +136,24 @@ function todasPistasCompletas(round, sala) {
   return ordem.length > 0 && ordem.every((id) => (round.contagemPalavras[id] ?? 0) >= PALAVRAS_POR_JOGADOR);
 }
 
+/** Próximo na roda (depois de depoisDeSid) que ainda precisa enviar pistas. */
+function proximoComPistasPendentes(r, sala, depoisDeSid) {
+  const ordem = ordemTurnoAtiva(r, sala);
+  const n = ordem.length;
+  if (!n) return null;
+  const start =
+    depoisDeSid != null && ordem.includes(depoisDeSid)
+      ? (ordem.indexOf(depoisDeSid) + 1) % n
+      : 0;
+  for (let k = 0; k < n; k++) {
+    const sid = ordem[(start + k) % n];
+    if ((r.contagemPalavras[sid] ?? 0) < PALAVRAS_POR_JOGADOR) return sid;
+  }
+  return null;
+}
+
 /**
- * Avança a vez a partir de quem acabou de enviar (evita mesmo jogador repetir sem passar).
+ * Avança a vez a partir de quem acabou de enviar.
  * @param {SalaState} sala
  * @param {string} sessionIdQueEnviou
  */
@@ -145,25 +161,18 @@ function avancarTurnoAposPista(sala, sessionIdQueEnviou) {
   const r = sala.round;
   if (!r || r.fase !== "pistas") return;
   r.ordemTurno = r.ordemTurno.filter((id) => sala.players.has(id));
-  const ordem = ordemTurnoAtiva(r, sala);
-  const n = ordem.length;
-  if (n === 0) {
-    r.fase = "votacao";
+  const next = proximoComPistasPendentes(r, sala, sessionIdQueEnviou);
+  if (next) {
+    r.turnoAtualId = next;
     return;
   }
-  const from = ordem.indexOf(sessionIdQueEnviou);
-  const start = from >= 0 ? from : 0;
-  for (let step = 1; step <= n; step++) {
-    const i = (start + step) % n;
-    const sid = ordem[i];
-    if ((r.contagemPalavras[sid] ?? 0) < PALAVRAS_POR_JOGADOR) {
-      const idxFull = r.ordemTurno.indexOf(sid);
-      r.indiceTurno = idxFull >= 0 ? idxFull : i;
-      return;
-    }
-  }
   r.fase = "votacao";
-  r.indiceTurno = 0;
+  r.turnoAtualId = null;
+  r.mensagens.push({
+    tipo: "sistema",
+    texto: "Todos deram suas pistas. Vote em quem acha que é o impostor.",
+    ts: Date.now(),
+  });
 }
 
 function todosViramPalavra(sala, round) {
@@ -177,6 +186,21 @@ function tentarIniciarPistasAposRevelacao(sala, codigo) {
   const r = sala.round;
   if (!r || r.fase !== "revelacao") return;
   if (!todosViramPalavra(sala, r)) return;
+  const io = globalThis.__io;
+
+  if ((sala.modoSala ?? "online") === "presencial") {
+    r.fase = "votacao";
+    r.turnoAtualId = null;
+    r.mensagens.push({
+      tipo: "sistema",
+      texto:
+        "Modo presencial: joguem à mesa com a palavra (ou o impostor sem ela). Quando quiserem, votem abaixo.",
+      ts: Date.now(),
+    });
+    if (io) io.to(codigo).emit("rodadaIniciada", { faseVotacao: true });
+    return;
+  }
+
   r.fase = "pistas";
   const idsAtuais = [...sala.players.keys()];
   r.ordemTurno = embaralhar(idsAtuais);
@@ -184,6 +208,7 @@ function tentarIniciarPistasAposRevelacao(sala, codigo) {
     if (r.contagemPalavras[id] === undefined) r.contagemPalavras[id] = 0;
   }
   r.indiceTurno = 0;
+  r.turnoAtualId = proximoComPistasPendentes(r, sala, null);
   r.mensagens.push({
     tipo: "sistema",
     texto: "Todos viram a palavra (ou o papel de impostor). Comecem as pistas!",
@@ -195,7 +220,6 @@ function tentarIniciarPistasAposRevelacao(sala, codigo) {
     ts: Date.now(),
   });
   garantirTurnoComSocket(sala);
-  const io = globalThis.__io;
   if (io) io.to(codigo).emit("rodadaIniciada", { fasePistas: true });
 }
 
@@ -203,50 +227,51 @@ function tentarIniciarPistasAposRevelacao(sala, codigo) {
  * Se quem deveria jogar está sem socket ou já completou pistas, ajusta o índice (sem somar palavra).
  * @param {SalaState} sala
  */
+/** Primeiro jogador online na roda a partir de startAfter (exclusivo) com pistas pendentes. */
+function primeiroOnlineComPistasPendentes(r, sala, startAfterSid) {
+  const ordem = ordemTurnoAtiva(r, sala);
+  const n = ordem.length;
+  if (!n) return null;
+  const start =
+    startAfterSid != null && ordem.includes(startAfterSid)
+      ? (ordem.indexOf(startAfterSid) + 1) % n
+      : 0;
+  for (let k = 0; k < n; k++) {
+    const sid = ordem[(start + k) % n];
+    if (!sala.sessionSocket.has(sid)) continue;
+    if ((r.contagemPalavras[sid] ?? 0) < PALAVRAS_POR_JOGADOR) return sid;
+  }
+  return null;
+}
+
 function garantirTurnoComSocket(sala) {
   const r = sala.round;
   if (!r || r.fase !== "pistas") return;
   if (sala.sessionSocket.size === 0) return;
   r.ordemTurno = r.ordemTurno.filter((id) => sala.players.has(id));
-  const ordem = ordemTurnoAtiva(r, sala);
-  const n = ordem.length;
-  if (n === 0) return;
+  const cur = r.turnoAtualId;
+  if (
+    cur &&
+    sala.players.has(cur) &&
+    sala.sessionSocket.has(cur) &&
+    (r.contagemPalavras[cur] ?? 0) < PALAVRAS_POR_JOGADOR
+  ) {
+    return;
+  }
 
-  let guard = 0;
-  while (guard++ <= n + 2) {
-    const cur = jogadorDaVezId(r);
-    if (!cur) {
-      r.indiceTurno = 0;
-      break;
-    }
-    const okSocket = sala.sessionSocket.has(cur);
-    const okCount = (r.contagemPalavras[cur] ?? 0) < PALAVRAS_POR_JOGADOR;
-    if (okSocket && okCount) return;
-
-    const from = ordem.indexOf(cur);
-    const start = from >= 0 ? from : 0;
-    let found = false;
-    for (let step = 1; step <= n; step++) {
-      const i = (start + step) % n;
-      const sid = ordem[i];
-      if (!sala.sessionSocket.has(sid)) continue;
-      if ((r.contagemPalavras[sid] ?? 0) >= PALAVRAS_POR_JOGADOR) continue;
-      const idxFull = r.ordemTurno.indexOf(sid);
-      r.indiceTurno = idxFull >= 0 ? idxFull : i;
-      found = true;
-      break;
-    }
-    if (found) return;
-    if (todasPistasCompletas(r, sala)) {
-      r.fase = "votacao";
-      r.mensagens.push({
-        tipo: "sistema",
-        texto: "Todos deram suas pistas. Vote em quem acha que é o impostor.",
-        ts: Date.now(),
-      });
-      return;
-    }
-    break;
+  const next = primeiroOnlineComPistasPendentes(r, sala, cur);
+  if (next) {
+    r.turnoAtualId = next;
+    return;
+  }
+  if (todasPistasCompletas(r, sala)) {
+    r.fase = "votacao";
+    r.turnoAtualId = null;
+    r.mensagens.push({
+      tipo: "sistema",
+      texto: "Todos deram suas pistas. Vote em quem acha que é o impostor.",
+      ts: Date.now(),
+    });
   }
 }
 
@@ -329,8 +354,10 @@ function estadoPublicoDaSala(codigo) {
     });
   }
 
+  const modo = sala.modoSala ?? "online";
   const extra = {
-    lobbyMsgs: sala.round ? [] : sala.lobbyMsgs,
+    modoSala: modo,
+    lobbyMsgs: sala.round || modo !== "online" ? [] : sala.lobbyMsgs,
     faseRodada: /** @type {null | "revelacao" | "pistas" | "votacao" | "resultado"} */ (null),
     jogadorDaVezId: /** @type {string | null} */ (null),
     contagemPalavras: /** @type {Record<string, number>} */ ({}),
@@ -424,6 +451,7 @@ function removerJogadorDaSala(codigo, sessionId) {
     } else if (r.fase === "pistas") {
       if (todasPistasCompletas(r, sala)) {
         r.fase = "votacao";
+        r.turnoAtualId = null;
         r.mensagens.push({
           tipo: "sistema",
           texto: "Todos deram suas pistas. Vote em quem acha que é o impostor.",
@@ -578,7 +606,7 @@ io.on("connection", (socket) => {
     });
   }
 
-  socket.on("criarSala", ({ nome, sessionId }, cb) => {
+  socket.on("criarSala", ({ nome, sessionId, modoSala }, cb) => {
     const meta = socket.data.impostor;
     if (meta?.codigo) {
       socket.leave(meta.codigo);
@@ -597,6 +625,8 @@ io.on("connection", (socket) => {
       return;
     }
     const name = v.nome;
+    const modo =
+      modoSala === "presencial" || modoSala === "online" ? modoSala : "online";
     salas.set(codigo, {
       hostSessionId: sid,
       players: new Map([[sid, { name }]]),
@@ -604,6 +634,7 @@ io.on("connection", (socket) => {
       disconnectTimers: new Map(),
       round: null,
       lobbyMsgs: [],
+      modoSala: modo,
     });
     const sala = salas.get(codigo);
     anexarSocketASessao(socket, sala, codigo, sid);
@@ -637,6 +668,10 @@ io.on("connection", (socket) => {
     const sala = salas.get(meta.codigo);
     if (!sala || sala.round) {
       cb?.({ ok: false, erro: "Chat livre só antes da rodada." });
+      return;
+    }
+    if ((sala.modoSala ?? "online") !== "online") {
+      cb?.({ ok: false, erro: "Esta sala é presencial — sem chat no lobby." });
       return;
     }
     const t = String(texto ?? "").trim().slice(0, TEXTO_CHAT_MAX);
@@ -693,6 +728,11 @@ io.on("connection", (socket) => {
     const contagemPalavras = {};
     for (const id of ids) contagemPalavras[id] = 0;
 
+    const msgInicial =
+      (sala.modoSala ?? "online") === "presencial"
+        ? "O dono definiu a palavra secreta. Cada jogador deve clicar em Ver palavra (ou ver se é o impostor). Modo presencial: depois joguem à mesa; quando quiserem, votem no app."
+        : "O dono definiu a palavra secreta. Cada jogador deve clicar em Ver palavra (ou ver se é o impostor). Quando todos tiverem visto, começam as pistas no chat.";
+
     sala.round = {
       word,
       impostorId,
@@ -700,12 +740,12 @@ io.on("connection", (socket) => {
       viramPalavra: new Set([sid]),
       ordemTurno,
       indiceTurno: 0,
+      turnoAtualId: null,
       contagemPalavras,
       mensagens: [
         {
           tipo: "sistema",
-          texto:
-            "O dono definiu a palavra secreta. Cada jogador deve clicar em Ver palavra (ou ver se é o impostor). Quando todos tiverem visto, começam as pistas.",
+          texto: msgInicial,
           ts: Date.now(),
         },
       ],
@@ -733,6 +773,14 @@ io.on("connection", (socket) => {
       cb?.({ ok: false, erro: "Não é hora de pistas." });
       return;
     }
+    if ((sala.modoSala ?? "online") === "presencial") {
+      cb?.({ ok: false, erro: "Modo presencial — as pistas são à mesa, não pelo app." });
+      return;
+    }
+    if ((sala.round.contagemPalavras[sid] ?? 0) >= PALAVRAS_POR_JOGADOR) {
+      cb?.({ ok: false, erro: "Você já enviou todas as suas palavras nesta rodada." });
+      return;
+    }
     const ativo = jogadorDaVezId(sala.round);
     if (sid !== ativo) {
       cb?.({ ok: false, erro: "Aguarde a sua vez." });
@@ -756,6 +804,7 @@ io.on("connection", (socket) => {
 
     if (todasPistasCompletas(sala.round, sala)) {
       sala.round.fase = "votacao";
+      sala.round.turnoAtualId = null;
       sala.round.mensagens.push({
         tipo: "sistema",
         texto: "Todos deram suas pistas. Vote em quem acha que é o impostor.",

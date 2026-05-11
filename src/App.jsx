@@ -57,6 +57,7 @@ export default function App() {
   const [copiouCodigo, setCopiouCodigo] = useState(false);
   const [resultadoOverlayFechado, setResultadoOverlayFechado] = useState(false);
   const [turnoModalDisp, setTurnoModalDisp] = useState(false);
+  const [modoSalaCriacao, setModoSalaCriacao] = useState("online");
   const chatRef = useRef(null);
   const donoRef = useRef(false);
   const faseAnteriorRef = useRef(null);
@@ -159,7 +160,7 @@ export default function App() {
       setResultadoOverlayFechado(false);
       setPodeVerPalavra(true);
       setJaVotei(false);
-      if (payload?.fasePistas) {
+      if (payload?.fasePistas || payload?.faseVotacao) {
         return;
       }
       if (!donoRef.current) {
@@ -207,10 +208,12 @@ export default function App() {
   const entrarLobby = useMemo(() => !sala, [sala]);
 
   const fase = sala?.faseRodada ?? null;
+  const modoSala = sala?.modoSala ?? "online";
   const meuSessionId = ensureSessionId();
   const jaViramPalavra = Boolean(sala?.viramPalavraIds?.includes(meuSessionId));
   const minhaVezPista = Boolean(
-    rodadaAtiva &&
+    modoSala === "online" &&
+      rodadaAtiva &&
       fase === "pistas" &&
       sala?.jogadorDaVezId &&
       meuSessionId === sala.jogadorDaVezId,
@@ -246,7 +249,10 @@ export default function App() {
       return;
     }
     const sessionId = ensureSessionId();
-    socket.emit("criarSala", { nome: nome.trim(), sessionId }, (res) => {
+    socket.emit(
+      "criarSala",
+      { nome: nome.trim(), sessionId, modoSala: modoSalaCriacao },
+      (res) => {
       if (!res?.ok) {
         setErro(res?.erro || "Não foi possível criar a sala.");
         return;
@@ -256,7 +262,8 @@ export default function App() {
       setSala(res.estado);
       setVoceEhDono(true);
       limparRodadaUi();
-    });
+    },
+    );
   };
 
   const entrarSala = () => {
@@ -492,6 +499,40 @@ export default function App() {
                 maxLength={24}
                 autoComplete="off"
               />
+              <div className="modo-sala-block">
+                <p className="label modo-sala-heading">Como vão jogar?</p>
+                <div className="modo-sala-row">
+                  <span
+                    className={`modo-sala-pill ${modoSalaCriacao === "presencial" ? "ativo" : ""}`}
+                  >
+                    Presencial
+                  </span>
+                  <button
+                    type="button"
+                    className={`ios-toggle ${modoSalaCriacao === "online" ? "on" : ""}`}
+                    aria-label={
+                      modoSalaCriacao === "online"
+                        ? "Modo online ativo — toque para presencial"
+                        : "Modo presencial ativo — toque para online"
+                    }
+                    onClick={() =>
+                      setModoSalaCriacao((m) => (m === "online" ? "presencial" : "online"))
+                    }
+                  >
+                    <span className="ios-toggle-knob" />
+                  </button>
+                  <span
+                    className={`modo-sala-pill ${modoSalaCriacao === "online" ? "ativo" : ""}`}
+                  >
+                    Online
+                  </span>
+                </div>
+                <p className="hint modo-sala-hint">
+                  {modoSalaCriacao === "online"
+                    ? "Lobby e pistas por escrito neste chat."
+                    : "Sem chat: só ver a palavra no telefone e jogar à mesa; a votação fica no app."}
+                </p>
+              </div>
               <button type="button" className="btn primary block menu-acao" onClick={criarSala}>
                 Criar sala
               </button>
@@ -565,8 +606,10 @@ export default function App() {
 
             <p className="hint">
               Mínimo de 3 jogadores para gerar palavra. Máximo 10 na sala. Depois de gerar, todos
-              devem ver a palavra (ou o papel de impostor); só então começam as pistas —{" "}
-              {PALAVRAS_POR_JOGADOR} palavras por pessoa, uma de cada vez.
+              devem ver a palavra (ou o papel de impostor).
+              {modoSala === "online"
+                ? ` Só então começam as pistas no chat — ${PALAVRAS_POR_JOGADOR} palavras por pessoa, uma de cada vez.`
+                : " Modo presencial: joguem à mesa; usem o app só para votar (e para ver a palavra)."}
             </p>
             {voceEhDono && rodadaAtiva && fase === "revelacao" && (
               <p className="hint revelacao-wait">
@@ -583,7 +626,7 @@ export default function App() {
                     {j.nome}
                     {j.online === false ? <span className="pill warn">Ausente</span> : null}
                     {j.dono ? <span className="pill">Dono</span> : null}
-                    {fase === "pistas" && rodadaAtiva && (
+                    {modoSala === "online" && fase === "pistas" && rodadaAtiva && (
                       <span className="pill faint">
                         {sala?.contagemPalavras?.[j.id] ?? 0}/{PALAVRAS_POR_JOGADOR} pistas
                       </span>
@@ -594,65 +637,77 @@ export default function App() {
             </div>
 
             <div className="chat">
-              <p className="label">Chat da sala</p>
-              <div className="chat-log" ref={chatRef}>
-                {!rodadaAtiva &&
-                  (sala?.lobbyMsgs ?? []).map((m) => (
-                    <div key={`${m.ts}-${m.autorId}`} className="msg lobby">
-                      <span className="msg-autor">{m.autorNome}:</span> {m.texto}
-                    </div>
-                  ))}
-                {rodadaAtiva &&
-                  (sala?.mensagensRodada ?? []).map((m, i) => (
-                    <div
-                      key={`${m.ts}-${i}`}
-                      className={`msg ${m.tipo === "sistema" ? "sistema" : "pista"}`}
-                    >
-                      {m.tipo === "sistema" ? (
-                        m.texto
-                      ) : (
-                        <>
-                          <span className="msg-autor">{m.autorNome}:</span>{" "}
-                          <strong>{m.texto}</strong>
-                        </>
-                      )}
-                    </div>
-                  ))}
-              </div>
-              {!rodadaAtiva && (
-                <form className="chat-form" onSubmit={enviarLobby}>
-                  <input
-                    className="input"
-                    placeholder="Digite algo para a sala..."
-                    value={lobbyInput}
-                    onChange={(e) => setLobbyInput(e.target.value)}
-                    maxLength={120}
-                  />
-                  <button type="submit" className="btn primary">
-                    Enviar
-                  </button>
-                </form>
-              )}
-              {rodadaAtiva && fase === "pistas" && (
+              <p className="label">
+                {modoSala === "online" ? "Chat da sala" : "Modo presencial"}
+              </p>
+              {modoSala === "presencial" ? (
+                <p className="hint presencial-blurb">
+                  {rodadaAtiva
+                    ? "Sem chat de pistas aqui — joguem à mesa com a palavra (ou o impostor sem ela). A votação está logo abaixo."
+                    : "Sem chat no lobby: enviem o código uns aos outros e reúnam-se à mesa."}
+                </p>
+              ) : (
                 <>
-                  <p className="hint chat-hint">
-                    {minhaVezPista
-                      ? "Sua vez — uma palavra e Enter."
-                      : `Aguardando: ${nomeJogador(sala?.jogadorDaVezId)}`}
-                  </p>
-                  <form className="chat-form" onSubmit={enviarPista}>
-                    <input
-                      className="input"
-                      placeholder={minhaVezPista ? "Sua pista..." : "Não é a sua vez"}
-                      value={pistaInput}
-                      onChange={(e) => setPistaInput(e.target.value)}
-                      disabled={!minhaVezPista}
-                      maxLength={80}
-                    />
-                    <button type="submit" className="btn primary" disabled={!minhaVezPista}>
-                      Enviar
-                    </button>
-                  </form>
+                  <div className="chat-log" ref={chatRef}>
+                    {!rodadaAtiva &&
+                      (sala?.lobbyMsgs ?? []).map((m) => (
+                        <div key={`${m.ts}-${m.autorId}`} className="msg lobby">
+                          <span className="msg-autor">{m.autorNome}:</span> {m.texto}
+                        </div>
+                      ))}
+                    {rodadaAtiva &&
+                      (sala?.mensagensRodada ?? []).map((m, i) => (
+                        <div
+                          key={`${m.ts}-${i}`}
+                          className={`msg ${m.tipo === "sistema" ? "sistema" : "pista"}`}
+                        >
+                          {m.tipo === "sistema" ? (
+                            m.texto
+                          ) : (
+                            <>
+                              <span className="msg-autor">{m.autorNome}:</span>{" "}
+                              <strong>{m.texto}</strong>
+                            </>
+                          )}
+                        </div>
+                      ))}
+                  </div>
+                  {!rodadaAtiva && (
+                    <form className="chat-form" onSubmit={enviarLobby}>
+                      <input
+                        className="input"
+                        placeholder="Digite algo para a sala..."
+                        value={lobbyInput}
+                        onChange={(e) => setLobbyInput(e.target.value)}
+                        maxLength={120}
+                      />
+                      <button type="submit" className="btn primary">
+                        Enviar
+                      </button>
+                    </form>
+                  )}
+                  {rodadaAtiva && fase === "pistas" && (
+                    <>
+                      <p className="hint chat-hint">
+                        {minhaVezPista
+                          ? "Sua vez — uma palavra e Enter."
+                          : `Aguardando: ${nomeJogador(sala?.jogadorDaVezId)}`}
+                      </p>
+                      <form className="chat-form" onSubmit={enviarPista}>
+                        <input
+                          className="input"
+                          placeholder={minhaVezPista ? "Sua pista..." : "Não é a sua vez"}
+                          value={pistaInput}
+                          onChange={(e) => setPistaInput(e.target.value)}
+                          disabled={!minhaVezPista}
+                          maxLength={80}
+                        />
+                        <button type="submit" className="btn primary" disabled={!minhaVezPista}>
+                          Enviar
+                        </button>
+                      </form>
+                    </>
+                  )}
                 </>
               )}
             </div>
@@ -814,9 +869,15 @@ export default function App() {
             <h2 id="turn-modal-title" className="turn-title">
               É a sua vez
             </h2>
+            {revelacao?.tipo === "palavra" && (
+              <p className="turn-rev palavra">A palavra é: {revelacao.palavra}</p>
+            )}
+            {revelacao?.tipo === "impostor" && (
+              <p className="turn-rev impostor">Você é o impostor — não há palavra para mostrar.</p>
+            )}
             <p className="turn-sub">
-              Role um pouco se precisar: use o campo <strong>«Sua pista…»</strong> no chat e envie{" "}
-              <strong>uma palavra</strong>. Todos vão ver na hora.
+              Use o campo <strong>«Sua pista…»</strong> no chat e envie <strong>uma palavra</strong>.
+              Todos vão ver na hora.
             </p>
             <button
               type="button"
@@ -831,8 +892,8 @@ export default function App() {
 
       <footer className="footer">
         <p>
-          <span className="footer-slash">/</span> jogue presencialmente — conversem, votem, divirtam-se{" "}
-          <span className="footer-slash">/</span>
+          <span className="footer-slash">/</span> jogue presencialmente ou online — conversem, votem,
+          divirtam-se <span className="footer-slash">/</span>
         </p>
       </footer>
 
@@ -1383,6 +1444,79 @@ export default function App() {
         .menu-acao {
           margin-top: 1rem;
         }
+        .modo-sala-block {
+          margin-top: 1rem;
+          padding: 0.85rem 0.75rem;
+          border-radius: var(--radius);
+          border: 1px solid rgba(0, 232, 255, 0.2);
+          background: rgba(0, 232, 255, 0.04);
+        }
+        .modo-sala-heading {
+          margin-bottom: 0.55rem;
+        }
+        .modo-sala-row {
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          gap: 0.65rem;
+        }
+        .modo-sala-pill {
+          font-size: 0.72rem;
+          font-weight: 700;
+          letter-spacing: 0.06em;
+          text-transform: uppercase;
+          color: var(--muted);
+          transition: color 0.15s, text-shadow 0.15s;
+        }
+        .modo-sala-pill.ativo {
+          color: var(--accent);
+          text-shadow: 0 0 12px rgba(0, 232, 255, 0.35);
+        }
+        .modo-sala-hint {
+          margin: 0.65rem 0 0;
+          text-align: center;
+          font-size: 0.8rem;
+        }
+        .ios-toggle {
+          position: relative;
+          width: 52px;
+          height: 30px;
+          border-radius: 999px;
+          border: none;
+          padding: 0;
+          cursor: pointer;
+          flex-shrink: 0;
+          background: rgba(80, 80, 100, 0.85);
+          box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.45);
+          transition: background 0.22s ease;
+        }
+        .ios-toggle.on {
+          background: linear-gradient(145deg, #34c759 0%, #28a745 100%);
+          box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.2), 0 0 16px rgba(52, 199, 89, 0.35);
+        }
+        .ios-toggle:focus-visible {
+          outline: 2px solid var(--accent);
+          outline-offset: 3px;
+        }
+        .ios-toggle-knob {
+          position: absolute;
+          top: 3px;
+          left: 3px;
+          width: 24px;
+          height: 24px;
+          border-radius: 50%;
+          background: #fff;
+          box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35);
+          transition: transform 0.22s ease;
+        }
+        .ios-toggle.on .ios-toggle-knob {
+          transform: translateX(22px);
+        }
+        .presencial-blurb {
+          margin: 0;
+          padding: 0.65rem 0.5rem;
+          line-height: 1.45;
+        }
         .revelacao-wait {
           text-align: center;
           color: var(--accent);
@@ -1461,6 +1595,21 @@ export default function App() {
         }
         .turn-sub strong {
           color: var(--accent);
+        }
+        .turn-rev {
+          margin: 0.5rem 0 0.35rem;
+          text-align: center;
+          font-size: 1rem;
+          font-weight: 700;
+          font-family: var(--font-mono);
+        }
+        .turn-rev.palavra {
+          color: var(--accent);
+          text-shadow: 0 0 18px rgba(0, 232, 255, 0.35);
+        }
+        .turn-rev.impostor {
+          color: var(--magenta);
+          text-shadow: 0 0 18px rgba(255, 45, 139, 0.35);
         }
       `}</style>
     </div>
